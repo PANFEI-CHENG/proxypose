@@ -45,7 +45,7 @@ def loaders_for(cfg, batch, steps):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--config', default='config/REAL/camera_real.yaml')
-    parser.add_argument('--output', default='log/axis_completion_smoke')
+    parser.add_argument('--output', default='log/axis_generation_smoke')
     parser.add_argument('--fixed-steps', type=int, default=120)
     parser.add_argument('--stream-steps', type=int, default=120)
     parser.add_argument('--peak-steps', type=int, default=20)
@@ -118,7 +118,7 @@ def main():
             norm = torch.nn.utils.clip_grad_norm_(parameters, float('inf'), error_if_nonfinite=True)
             if not history:
                 for name in ('encoder', 'decoder', 'missing_head', 'score_head', 'refine_head',
-                             'fold_head', 'keypoint_proj', 'detail_proj', 'axis_head', 'axis_embed', 'axis_refine_head'):
+                             'fold_head', 'keypoint_proj', 'axis_head', 'axis_embed', 'axis_refine_head'):
                     module = getattr(model.completion, name)
                     gradient_checks[name] = sum(p.grad.abs().sum().item() for p in module.parameters() if p.grad is not None)
                 assert all(value > 0 for value in gradient_checks.values()), gradient_checks

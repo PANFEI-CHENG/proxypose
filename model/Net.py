@@ -8,7 +8,8 @@ from model.modules import ModifiedResnet, PointNet2MSG
 from model.Net_modules import (InstanceAdaptiveKeypointDetector, GeometricAwareFeatureAggregator,
                                FrontDoorEncoder, PoseSizeEstimator, NOCS_Predictor)
 from model.compose_completion import (ComposeCompletion, ComposeCompletionLoss, canonical_to_camera,
-                                     geometric_relation_loss, axis_proxy_loss, axis_scale_loss)
+                                     geometric_relation_loss, axis_proxy_loss, axis_scale_loss,
+                                     axis_structure_loss)
 from utils.data_utils import generate_augmentation
 
 
@@ -77,7 +78,7 @@ class Net(nn.Module):
         point_features = torch.cat((pts_local, rgb_local), dim=1).transpose(1, 2)
         kpt_feature = self.GAFA(heat_map @ point_features, observed_kpt.detach(), point_features, pts)
         kpt_feature = self.FD_Encoder(kpt_feature, select_global_feats)
-        completion, decoded = self.completion(observed_kpt, kpt_feature, pts, point_features)
+        completion, decoded = self.completion(observed_kpt, kpt_feature)
         kpt_nocs = self.nocs_predictor(decoded, index)
         axis_nocs = self.completion.axis_template[None].expand(b, -1, -1)
         pose_points = torch.cat((completion['completion_keypoints'], completion['axis_points']), dim=1)
@@ -145,6 +146,7 @@ class Loss(nn.Module):
             'loss_geo': cfg.geo * geometric_relation_loss(e['pred_kpt_3d'], e['pred_kpt_nocs'], size),
             'loss_axis': cfg.axis * axis_loss,
             'loss_axis_scale': cfg.axis_scale * axis_scale_loss(e['axis_points'], scale, e['axis_nocs'].abs().amax()),
+            'loss_axis_structure': cfg.axis_structure * axis_structure_loss(e['axis_points'], scale),
         }
         losses['loss_all'] = sum(losses.values())
         losses.update({key: cfg.recon * value for key, value in completion.items()})

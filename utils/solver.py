@@ -45,7 +45,7 @@ class Solver(gorilla.solver.BaseSolver):
                 if 'loss' in key:
                     dict_info['train_'+key] = value
             
-            if self.epoch % 5 == 0:
+            if self.epoch % 2 == 0 or self.epoch == self.cfg.max_epoch:
                 ckpt_path = os.path.join(
                     self.cfg.ckpt_dir, 'epoch_' + str(self.epoch) + '.pt')
                 
@@ -56,9 +56,9 @@ class Solver(gorilla.solver.BaseSolver):
                     del checkpoint[key]
                 
                 torch.save(checkpoint, ckpt_path)
-
-            
-            if self.epoch == self.cfg.max_epoch:
+                # Save the matching FD queue with each checkpoint for evaluation.
+                with open(os.path.join(self.cfg.ckpt_dir, f'tensor_list_epoch_{self.epoch}.pkl'), 'wb') as f:
+                    cPickle.dump(tensor_list, f)
                 list_path = os.path.join(
                     self.cfg.ckpt_dir, 'tensor_list.pkl')
 

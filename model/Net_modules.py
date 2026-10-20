@@ -492,10 +492,23 @@ class PoseSizeEstimator(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 3),
         )
+        for head in (self.rotation_estimator, self.translation_estimator):
+            nn.init.normal_(head[-1].weight, std=0.001)
+            nn.init.zeros_(head[-1].bias)
         
     def forward(self, pts1, pts2, pts1_local):#, kpt_normal
-        pts1 = self.pts_mlp1(pts1.transpose(1,2))
-        pts2 = self.pts_mlp2(pts2.transpose(1,2))
+        # Read the pose FROM generated ordered axis points, before feature refinement.
+        axes_xyz = pts1[:, -3 * self.axis_points:].reshape(-1, 3, self.axis_points, 3)
+        ticks = pts2[:, -3 * self.axis_points:-2 * self.axis_points, 0]
+        axis_center = axes_xyz.mean((1, 2))
+        vectors = ((axes_xyz - axis_center[:, None, None]) * ticks[:, None, :, None]).sum(2)
+        vectors = vectors / ticks.square().sum(1)[:, None, None]
+        axis_rotation = Ortho6d2Mat(vectors[:, 0], vectors[:, 1])
+        axis_scale = vectors.norm(dim=-1).mean(1, keepdim=True).clamp_min(1e-4)
+        # Feature losses do not move points via positional inputs; the geometric
+        # readout above deliberately remains differentiable into the axis generator.
+        pts1 = self.pts_mlp1(pts1.detach().transpose(1,2))
+        pts2 = self.pts_mlp2(pts2.detach().transpose(1,2))
         pose_feat = torch.cat([pts1, pts1_local.transpose(1,2), pts2], dim=1) # b, c, n
 
         pose_feat = self.pose_mlp1(pose_feat) # b, c, n
@@ -509,9 +522,11 @@ class PoseSizeEstimator(nn.Module):
         axes = pose_feat[:, :, split:].reshape(-1, 512, 3, self.axis_points).mean(3).flatten(1)
         pose_feat = self.group_fusion(torch.cat((surface, axes), dim=1))
 
-        r = self.rotation_estimator(pose_feat) # pose_feat
-        r = Ortho6d2Mat(r[:, :3].contiguous(), r[:, 3:].contiguous()).view(-1,3,3)
-        t = self.translation_estimator(pose_feat)
-        s = self.size_estimator(pose_feat)
+        # Small corrections keep generated axes responsible for the main pose.
+        residual = 0.1 * self.rotation_estimator(pose_feat).tanh()
+        residual = residual + residual.new_tensor([1., 0., 0., 0., 1., 0.])
+        r = axis_rotation @ Ortho6d2Mat(residual[:, :3], residual[:, 3:])
+        t = axis_center + 0.1 * axis_scale * self.translation_estimator(pose_feat).tanh()
+        s = axis_scale * F.softplus(self.size_estimator(pose_feat))
         return r,t,s
     

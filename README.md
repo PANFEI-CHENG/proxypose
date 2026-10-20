@@ -87,13 +87,18 @@ python train.py --config config/REAL/camera_real.yaml
 ```
 The NOCS config enables ComPose-style completion immediately after `FD_Encoder`,
 implemented in [`model/compose_completion.py`](model/compose_completion.py) using
-the vendored AdaPoinTr attention blocks. It combines 96 detected keypoints with
-256 sampled point features, selects and refines 64 completion keypoints, then
+the vendored AdaPoinTr attention blocks. Its memory contains only the 96 detected
+keypoints and their FD features. It selects and refines 64 completion keypoints, then
 expands them into 1,024 points for shape supervision. A parallel axis head
-predicts three sampled coordinate axes (16 points per axis, 48 total). The
+directly generates three sampled coordinate axes (16 points per axis, 48 total),
+without predicting a pose to transform an axis template. Axis queries use global
+attention; local KNN attention only processes surface keypoints. The
 pose/size head uses **64 completion keypoints + 48 axis points**, with their
 features and separate pooling for the surface and each axis. The dense 1,024
-points are not pose-head inputs. Optimizer and LR scheduler settings are unchanged.
+points are not pose-head inputs. Pose is read from the generated axes and refined
+with small feature-conditioned corrections. Optimizer and LR scheduler settings
+are unchanged. Weights and matching FD queues are saved every two epochs and at
+the final epoch.
 
 There is one completion/axis path; the old mode switches, native adapter and
 Reconstructor fallback have been removed. `recon_delta` contains the actual
@@ -108,7 +113,7 @@ adaptations, and smoke-training results. To reproduce the real-data smoke run:
 ```bash
 .pixi/envs/default/bin/python tools/smoke_completion.py \
   --fixed-steps 240 --stream-steps 240 --peak-steps 60 --full-steps 5 \
-  --batch-size 40 --output log/axis_frame_smoke
+  --batch-size 40 --output log/axis_generation_smoke_b40
 ```
 
 ## Evaluate 

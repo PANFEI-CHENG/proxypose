@@ -30,9 +30,12 @@ retained. In particular, upstream's ranking uses discrete `argsort`; it has no
 gradient to ranking parameters, and no additional score gate is introduced.
 
 The active network has one path. `model/compose_completion.py` reuses only the
-vendored encoder/decoder attention blocks and implements ComPose-style scored
+vendored encoder and attention operators and implements ComPose-style scored
 selection, keypoint refinement and local expansion, plus sampled coordinate-axis
-proxies. Its decoder jointly processes 64 surface queries and 48 axis queries.
+proxies. Its custom decoder jointly processes 64 surface queries and 48 axis
+queries in global attention; local graph attention only processes the surface
+queries. Encoder memory consists only of the 96 detected keypoints. Axis heads
+generate point coordinates directly, followed by axis-to-pose readout and refinement.
 The old native adapter and mode selection have been removed. The upstream full
 model remains in this vendor file for provenance; it is not used by Net.
 See `docs/completion.md` for the current network and its real-data validation.

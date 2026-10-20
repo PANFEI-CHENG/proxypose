@@ -11,9 +11,8 @@ from torch import nn
 from torch.nn import functional as F
 from easydict import EasyDict
 
-from model.adapointr.AdaPoinTr import (
-    PointTransformerEncoderEntry, PointTransformerDecoderEntry,
-)
+from model.adapointr.AdaPoinTr import PointTransformerEncoderEntry
+from model.adapointr.Transformer_utils import Attention, CrossAttention, DynamicGraphAttention, knn_point
 from model.adapointr.compat import pointnet2_utils
 
 
@@ -44,6 +43,56 @@ def geometric_relation_loss(keypoints, nocs, size):
     return F.mse_loss(distances(nocs), distances(reference))
 
 
+class CompletionDecoderLayer(nn.Module):
+    """Global interaction for all queries; surface geometry only for surface queries."""
+    def __init__(self, cfg, local):
+        super().__init__()
+        dim = cfg.embed_dim
+        self.norm_self, self.norm_q, self.norm_v, self.norm_ffn = (nn.LayerNorm(dim) for _ in range(4))
+        self.self_attn = Attention(dim, cfg.num_heads)
+        self.cross_attn = CrossAttention(dim, dim, cfg.num_heads)
+        self.ffn = nn.Sequential(nn.Linear(dim, int(dim * cfg.mlp_ratio)), nn.GELU(),
+                                 nn.Linear(int(dim * cfg.mlp_ratio), dim))
+        self.local = local
+        if local:
+            self.local_self = DynamicGraphAttention(dim, k=cfg.k)
+            self.local_cross = DynamicGraphAttention(dim, k=cfg.k)
+            self.merge_self, self.merge_cross = nn.Linear(2 * dim, dim), nn.Linear(2 * dim, dim)
+
+    def forward(self, q, memory, surface_xyz, memory_xyz, self_idx, cross_idx):
+        count = surface_xyz.size(1)
+        norm_q = self.norm_self(q)
+        update = self.self_attn(norm_q)
+        if self.local:
+            local = self.local_self(norm_q[:, :count], surface_xyz, idx=self_idx)
+            surface = self.merge_self(torch.cat((update[:, :count], local), dim=-1))
+            update = torch.cat((surface, update[:, count:]), dim=1)
+        q = q + update
+        norm_q, norm_v = self.norm_q(q), self.norm_v(memory)
+        update = self.cross_attn(norm_q, norm_v)
+        if self.local:
+            local = self.local_cross(norm_q[:, :count], surface_xyz, v=norm_v,
+                                     v_pos=memory_xyz, idx=cross_idx)
+            surface = self.merge_cross(torch.cat((update[:, :count], local), dim=-1))
+            update = torch.cat((surface, update[:, count:]), dim=1)
+        q = q + update
+        return q + self.ffn(self.norm_ffn(q))
+
+
+class CompletionDecoder(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        self.k = cfg.k
+        self.blocks = nn.ModuleList(CompletionDecoderLayer(cfg, local=i == 0) for i in range(cfg.depth))
+
+    def forward(self, q, memory, surface_xyz, memory_xyz):
+        self_idx = knn_point(self.k, surface_xyz, surface_xyz)
+        cross_idx = knn_point(self.k, memory_xyz, surface_xyz)
+        for block in self.blocks:
+            q = block(q, memory, surface_xyz, memory_xyz, self_idx, cross_idx)
+        return q
+
+
 class ComposeCompletion(nn.Module):
     def __init__(self, cfg, feat_dim):
         super().__init__()
@@ -51,7 +100,6 @@ class ComposeCompletion(nn.Module):
         self.num_query = cfg.get('num_query', 64)
         self.num_missing = cfg.get('num_missing', 64)
         self.num_visible = cfg.get('num_visible', 32)
-        self.memory_points = cfg.get('memory_points', 256)
         self.factor = cfg.get('points_per_keypoint', 16)
         self.axis_points = cfg.axis_points_per_axis
         assert 3 * self.axis_points <= self.num_query
@@ -60,16 +108,16 @@ class ComposeCompletion(nn.Module):
         self.register_buffer('axis_template', axes)
         assert cfg.encoder_config.embed_dim == cfg.decoder_config.embed_dim == feat_dim
         self.keypoint_proj = nn.Sequential(nn.LayerNorm(feat_dim), nn.Linear(feat_dim, feat_dim))
-        self.detail_proj = nn.Sequential(nn.LayerNorm(feat_dim), nn.Linear(feat_dim, feat_dim))
         self.position = nn.Sequential(nn.Linear(3, feat_dim), nn.GELU(), nn.Linear(feat_dim, feat_dim))
         self.encoder = PointTransformerEncoderEntry(cfg.encoder_config)
-        self.decoder = PointTransformerDecoderEntry(cfg.decoder_config)
+        self.decoder = CompletionDecoder(cfg.decoder_config)
         self.global_proj = nn.Sequential(nn.Linear(feat_dim, feat_dim), nn.GELU(), nn.LayerNorm(feat_dim))
         self.missing_head = nn.Sequential(nn.Linear(feat_dim, feat_dim), nn.GELU(),
                                           nn.Linear(feat_dim, 3 * self.num_missing))
-        self.axis_head = nn.Sequential(nn.Linear(feat_dim, feat_dim), nn.GELU(), nn.Linear(feat_dim, 10))
+        self.axis_head = nn.Sequential(nn.Linear(feat_dim, feat_dim), nn.GELU(),
+                                       nn.Linear(feat_dim, 3 * axes.size(0)))
         self.axis_embed = nn.Sequential(nn.Linear(3, feat_dim), nn.GELU(), nn.Linear(feat_dim, feat_dim))
-        self.axis_refine_head = nn.Sequential(nn.Linear(3 * feat_dim, feat_dim), nn.GELU(), nn.Linear(feat_dim, 10))
+        self.axis_refine_head = nn.Sequential(nn.Linear(feat_dim, feat_dim), nn.GELU(), nn.Linear(feat_dim, 3))
         # Global conditioning lets the same coordinate receive different scores
         # for different observed shapes; the target remains ComPose eq. 10.
         self.score_head = nn.Sequential(nn.Linear(feat_dim + 3, feat_dim), nn.GELU(),
@@ -84,52 +132,34 @@ class ComposeCompletion(nn.Module):
                      self.axis_head, self.axis_refine_head):
             nn.init.normal_(head[-1].weight, std=0.001)
             nn.init.zeros_(head[-1].bias)
-        with torch.no_grad():
-            self.axis_head[-1].bias[3:9].copy_(torch.tensor([1., 0., 0., 0., 1., 0.]))
-            self.axis_head[-1].bias[9] = 0.54132485  # inverse softplus(1)
 
-    def axis_coordinates(self, frame, origin, extent):
-        # 3 center + 6 rotation + 1 scale: a straight, orthogonal right-handed frame.
-        x = F.normalize(frame[:, 3:6], dim=-1, eps=1e-6)
-        y = frame[:, 6:9] - (frame[:, 6:9] * x).sum(-1, keepdim=True) * x
-        y = F.normalize(y, dim=-1, eps=1e-6)
-        basis = torch.stack((x, y, torch.linalg.cross(x, y)), dim=1)
-        center = origin + frame[:, None, :3] * extent[:, None, None]
-        scale = F.softplus(frame[:, 9:10])[:, None] * extent[:, None, None]
-        return (self.axis_template @ basis) * scale + center
-
-    def forward(self, keypoints, features, points=None, point_features=None):
-        xyz, memory = keypoints, self.keypoint_proj(features)
-        if self.memory_points:
-            indices = sample_indices(points, self.memory_points)
-            xyz = torch.cat((xyz, gather_points(points, indices)), dim=1)
-            memory = torch.cat((memory, self.detail_proj(gather_points(point_features, indices))), dim=1)
+    def forward(self, keypoints, features):
+        # Geometry guides feature learning without moving the detector to ease attention.
+        xyz, memory = keypoints.detach(), self.keypoint_proj(features)
         memory = self.encoder(memory + self.position(xyz), xyz)
         global_feature = self.global_proj(memory.amax(dim=1))
         missing = self.missing_head(global_feature).view(-1, self.num_missing, 3)
-        missing = missing + keypoints.mean(dim=1, keepdim=True)
-        # Normalize axis prediction by observed extent; no GT scale is needed.
-        extent = 2.5 * (xyz - xyz.mean(1, keepdim=True)).square().sum(-1).mean(1).sqrt().clamp_min(1e-3).detach()
-        axis_frame = self.axis_head(global_feature)
-        origin = keypoints.mean(1, keepdim=True)
-        axis_coarse = self.axis_coordinates(axis_frame, origin, extent)
+        origin = xyz.mean(1, keepdim=True)
+        missing = missing + origin
+        extent = 2.5 * (xyz - origin).square().sum(-1).mean(1).sqrt().clamp_min(0.02)[:, None, None]
+        # Independent point displacements, not an R/t/scale transformation of the template.
+        axis_offsets = self.axis_head(global_feature).view(-1, 3 * self.axis_points, 3)
+        axis_coarse = origin + extent * (self.axis_template + axis_offsets)
         # Candidates remain based on the detected keypoints, rather than moving
         # completion ahead of keypoint detection as in the original ComPose.
         visible = gather_points(keypoints, sample_indices(keypoints, self.num_visible))
         candidates = torch.cat((missing, visible), dim=1)
-        scores = self.score_head(torch.cat((candidates, global_feature[:, None].expand(
+        scores = self.score_head(torch.cat((candidates.detach(), global_feature[:, None].expand(
             -1, candidates.size(1), -1)), dim=-1)).squeeze(-1)
         selected = scores.topk(self.num_query, dim=1).indices
         coarse = gather_points(candidates, selected)
         query_xyz = torch.cat((coarse, axis_coarse), dim=1)
-        query = global_feature[:, None] + self.position(query_xyz)
+        query = global_feature[:, None] + self.position(query_xyz.detach())
         identity = torch.cat((torch.zeros_like(query[:, :self.num_query]),
                               self.axis_embed(self.axis_template)[None].expand(query.size(0), -1, -1)), dim=1)
-        decoded = self.output_norm(self.decoder(q=query + identity, v=memory, q_pos=query_xyz, v_pos=xyz))
+        decoded = self.output_norm(self.decoder(query + identity, memory, coarse.detach(), xyz))
         decoded, axis_features = decoded[:, :self.num_query], decoded[:, self.num_query:]
-        axis_global = axis_features.reshape(-1, 3, self.axis_points, decoded.size(-1)).mean(2).flatten(1)
-        axis_frame = axis_frame + self.axis_refine_head(axis_global)
-        axis_refined = self.axis_coordinates(axis_frame, origin, extent)
+        axis_refined = axis_coarse + extent * self.axis_refine_head(axis_features)
         refined = coarse + self.refine_head(decoded)
         offsets = self.fold_head(torch.cat((decoded, refined), dim=-1)).view(-1, self.num_query, self.factor, 3)
         dense = (refined[:, :, None] + offsets).flatten(1, 2)
@@ -177,3 +207,20 @@ def axis_scale_loss(points, scale, half_length):
     lengths = (lines[:, :, -1] - lines[:, :, 0]).norm(dim=-1)
     ratio = lengths / (2 * half_length) / scale.flatten()[:, None]
     return F.smooth_l1_loss(ratio, torch.ones_like(ratio), beta=0.1)
+
+
+def axis_structure_loss(points, scale):
+    """Soft line/spacing/center/orthogonality priors; never project generated points."""
+    lines = points.reshape(points.size(0), 3, -1, 3)
+    lines = (lines - lines.mean((1, 2), keepdim=True)) / scale[:, None]
+    ticks = torch.linspace(-1, 1, lines.size(2), device=points.device, dtype=points.dtype)[None, None, :, None]
+    centers = lines.mean(2, keepdim=True)
+    vectors = (lines * ticks).sum(2) / ticks.square().sum()
+    fitted = centers + ticks * vectors[:, :, None]
+    straight = F.smooth_l1_loss(lines, fitted, beta=0.05)
+    centered = F.smooth_l1_loss(centers, torch.zeros_like(centers), beta=0.05)
+    unit = F.normalize(vectors, dim=-1, eps=1e-5)
+    gram = unit @ unit.transpose(1, 2)
+    orthogonal = (gram - torch.eye(3, device=points.device)).square().mean()
+    handed = F.smooth_l1_loss(torch.linalg.cross(unit[:, 0], unit[:, 1]), unit[:, 2], beta=0.1)
+    return straight + centered + orthogonal + handed

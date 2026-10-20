@@ -1,137 +1,139 @@
-# 补全关键点 + 坐标轴代理
+# 关键点补全 → 轴结构点生成 → 位姿修正
 
-当前只有一条网络路径：`IAKD → GAFA → FD_Encoder → 补全/轴点 → NOCS/位姿尺寸`。
-已移除 `completion_mode`、旧原生适配器和 Reconstructor 回退。训练入口仍为：
+当前路径为 `IAKD → GAFA → FD_Encoder → 补全/轴点生成 → 位姿尺寸`。
+只有这一条路径，没有 completion_mode 或旧 Reconstructor 回退。
 
-```bash
-.pixi/envs/default/bin/python train.py --config config/REAL/camera_real.yaml
-```
+## 点数与注意力
 
-## 数量与网络结构
+[ComPose §3.2、§4.1](https://arxiv.org/html/2605.25553v1) 的 64+32 是候选数，评分后
+保留 64 个关键点。本实现把补全放在 FD 之后，沿用该候选选择和完整 CAD 监督。
 
-[ComPose §3.2、§4.1](https://arxiv.org/html/2605.25553v1) 的 `64 + 32` 是候选数：
-64 个生成候选 + 32 个可见候选，评分选出 64 个关键点，再每点展开 16 个局部点。
-当前配置保留这个关系，同时保留 CleanPose 原有的 96 个 IAKD 观测关键点。
-
-| 阶段 | 数量 / 维度 |
+| 阶段 | 当前设置 |
 |---|---|
-| IAKD / GAFA / FD 观测关键点 | 96 × 256 |
-| 细粒度可见点记忆 | FPS 256 × 256 |
-| 补全候选 | 64 missing + 32 visible = 96 |
-| 筛选、细化后的补全关键点 | 64 × 256 |
-| 坐标轴代理 | 每轴 16 点，共 48 点 × 256 |
-| 共享 decoder 查询 | 64 + 48 = 112，2 层 |
-| 位姿/尺寸头输入 | **64 个补全关键点 + 48 个轴点及对应特征** |
-| 稠密补全输出 | 64 × 16 = 1024 点，仅用于完整形状监督 |
+| encoder memory | 96 个 IAKD 关键点及其 FD 特征，256 维 |
+| 补全候选 | 64 个生成候选 + 32 个可见关键点候选 |
+| decoder 查询 | 64 个补全关键点 + 48 个轴点 |
+| 轴模板 | 每轴 16 点，标准坐标范围 [-0.4, 0.4] |
+| 位姿头输入 | 64 个补全关键点 + 48 个轴点及对应特征 |
+| 稠密补全 | 每关键点展开 16 点，共 1024 点，仅用于形状监督 |
 
-代理点总数不超过关键点数，默认 48 < 64。网络不会把 1024 个稠密点送进位姿头。
-编码器/解码器采用本地 AdaPoinTr 几何感知注意力，深度各 2 层、通道 256、4 头。
-ComPose 官方仓库尚无实现，本模块是依据论文的适配。来源和许可见
-[UPSTREAM.md](../model/adapointr/UPSTREAM.md)。
+已删除细粒度点的采样、投影与 memory 拼接，补全模块只接收 `(keypoints, features)`。
+GAFA 本身仍按原结构使用可见点特征；它与本次移除的补全 memory 细粒度输入不同。
+encoder/decoder 各两层、256 维、4 个注意力头。
 
-## 轴代理的定义与特征
+两类查询共同参与全局 self-attention 和全局 cross-attention。decoder 第一层
+额外对 **64 个物体关键点** 做局部 self/cross graph attention，K=8；第二层
+仅使用全局注意力。局部 self-attention 的查询和邻居都是物体关键点，局部
+cross-attention 的邻居是 96 个观测关键点。轴点完全不参与 KNN 选邻居，也不会
+成为物体点的局部邻居。实现复用 AdaPoinTr 的注意力算子，见
+[来源与许可](../model/adapointr/UPSTREAM.md)。
 
-标准 NOCS 系中的三轴均在 `[-0.4, 0.4]` 均匀采样 16 点，每条线长度 0.8。
-使用偶数个点避免原点在三条轴上重复。采样位置、轴身份和正负方向固定。
-这是虚拟的坐标系代理，不是要求 CAD 表面上必须存在的真实点。
+## 直接生成轴点
 
-`axis_head` 与 `missing_head` 并行，从同一全局特征预测共享原点（3）、6D 旋转（6）
-和正尺度（1），共 10 个数。6D 旋转经正交化、尺度经 softplus 后变换固定模板，
-得到粗轴点。因此三轴严格共原点、等长、正交并构成右手系。
-预测使用可见点尺度归一化，不依赖 GT。轴点位置编码加标准模板身份编码，
-与补全查询共同经过 decoder，得到每个轴点的独立 256 维特征。随后按三轴汇聚
-这些特征，经 `axis_refine_head` 修正同一组 10 维参数，输出细化轴点。
-
-这三条标准轴按 `||size_gt||` 统一缩放，目标为：
+`axis_head` 与 `missing_head` 并行，从观测全局特征直接预测 48×3 个独立坐标偏移：
 
 ```text
-axis_camera = axis_template * ||size_gt|| @ rotation_gt.T + translation_gt
+coarse_axes = observed_center + observed_extent * (axis_template + point_offsets)
+final_axes  = coarse_axes + observed_extent * pointwise_refinement(decoded_axis_features)
 ```
 
-代理轴表示旋转、原点和统一尺度。物体三边长仍由位姿尺寸头结合补全关键点
-几何和特征学习，不把三条等长代理轴误当作物体长宽高。
+`axis_head` 的输出是 144 维；细化头逐点输出 3 维。没有轴分支的旋转头、平移头、
+尺度头，也不把输出投影到刚性标架。模板只提供初始化形状、轴身份与采样顺序，
+允许网络对每个轴点独立生成和修正，因此生成结果可以暂时不直、不正交。
+观测中心和尺度来自 detached 关键点；尺度为 2.5 倍 RMS 半径，半径下限 0.02 m，
+避免检测关键点初始聚集时轴模板退化到零。它不是预测的物体中心或物体尺寸。
 
-位姿头接收补全关键点的预测 NOCS、轴点已知的标准模板坐标，以及两类点的特征。
-它先提取逐点几何/特征，使用表面与轴等权的全局上下文，再分别池化表面、X/Y/Z
-四组特征后融合。这样不会因采样数变化而让一类点淹没另一类点。
+标准轴在相机空间的监督目标仍用 GT 姿态构造：
 
-## 监督
+```text
+target_axes = axis_template * ||size_gt|| @ rotation_gt.T + translation_gt
+```
 
-完整 CAD 使用 `completion_rotation_label` 的原始旋转还原到相机空间；轴点与
-NOCS 使用现有对称规范化后的 `rotation_label`。所有预测先还原随机几何增强
-和点云中心化，再计算损失。轴坐标误差除以 GT 尺度，避免大物体主导训练。
+这只是生成点的监督目标，不在推理时提供 GT，也不以网络预测的位姿生成轴点。
+瓶/碗/罐（类别 0/1/3）仅监督可辨识的 Y 轴；其他类别监督三轴。
 
-瓶、碗、罐（0-index 类别 0/1/3）绕 Y 轴的旋转不可辨识，因此仅对 Y 轴作
-有序点监督，不给 X/Z 强加任意方位；三轴的等长、正交和右手结构由参数化保证。
-其他类别监督全部三轴。这个约束思路与 [FS-Net 的对称轴处理](https://openaccess.thecvf.com/content/CVPR2021/html/Chen_FS-Net_Fast_Shape-Based_Network_for_Category-Level_6D_Object_Pose_Estimation_CVPR_2021_paper.html)
-一致，但这里使用采样轴点与共享特征。损失只使用监督标签，推理无需 CAD 或 GT。
+## 从轴点得到位姿，再作小幅修正
 
-| 损失 | 内容 | 权重 |
-|---|---|---:|
-| recon | missing、细化关键点、稠密点与完整 CAD 的三阶段平方 Chamfer | 15 |
-| score | 候选评分对 `exp(-到 CAD 最近距离 / 0.05)` 的 MSE | 1 |
-| axis | 尺度归一化 Smooth L1：细轴点 + 0.5 × 粗轴点，按对称性屏蔽不可辨识轴 | 1 |
-| axis_scale | 代理轴预测尺度 / GT 尺度与 1 的 Smooth L1 | 0.1 |
-| delta | 真实局部展开偏移的平均 L2 范数 | 0.05 |
-| geo | 补全关键点与 NOCS 的距离关系一致性 | 1 |
-| NOCS / pose / distillation / observed CD / diversity | 保留现有监督 | 保留原值 |
+位姿头根据有序轴点与标准采样位置的线性相关，拟合三条轴的方向和长度，
+用 X/Y 方向构造正交旋转，用三轴点的均值估计中心，用三轴拟合长度估计统一尺度。
+这一步的方向是 **生成轴点 → 位姿**。
 
-`recon_delta` 现在是实际输出，满足相机坐标系下：
+关键点与轴点特征分别池化，再融合用于修正：旋转采用 `identity6D + 0.1*tanh(residual)`
+构造局部旋转并乘到轴点读取的旋转上；平移修正限制为每分量 `0.1*axis_scale`。
+主要旋转和中心必须由轴结构承担，特征分支负责小幅修正。尺寸用正值形状系数
+乘轴结构尺度预测，三条标准轴的等长不等于物体三边长相等。
+
+## 梯度边界
+
+- encoder 的坐标输入、decoder 的坐标位置编码和 KNN 坐标 detach。
+- 候选评分的坐标输入 detach，评分训练置信特征，不通过移动候选来提高评分。
+- 位姿头的逐点坐标/NOCS 特征编码输入 detach；NOCS 几何监督目标仍 detach。
+- **轴点坐标进入方向、中心、尺度读取时不 detach**，最终位姿损失可反传到粗轴点头、
+  细化轴点头及共享特征。粗轴点到细轴点的残差路径也保留梯度。
+- 所有关键点/轴点特征保持可学习；物体补全坐标由完整 CAD 损失训练，IAKD 仍有
+  观测表面和多样性监督，以及特征路径的梯度。
+
+## 损失与保存
+
+保留三阶段完整 CAD 平方 Chamfer（权重 15）、候选评分（1）、NOCS（2）、
+几何关系（1）、位姿（0.3）、原观测点/蒸馏监督。`recon_delta` 是真实局部展开
+偏移，权重 0.05，在相机空间满足：
 
 ```text
 recon_model = pred_kpt_3d.repeat_interleave(16, dim=1) + recon_delta
 ```
 
-它在训练和推理时都返回，也参与正则。只约束稠密点相对所属关键点的局部偏移，
-不限制 missing 点对缺失部分的全局补全。由于补全采用平方 Chamfer，把 delta
-权重从 1 降为 0.05，避免局部点过度收缩到关键点。NOCS/geo 几何目标 detach；
-原可见表面与多样性损失只作用于 IAKD 观测关键点。
+轴点监督为尺度归一化 Smooth L1：细点 + 0.5×粗点，权重 1。轴长度监督权重 0.1。
+新增权重 0.05 的软结构先验：直线/均匀采样、共中心、方向正交与右手方向。
+这些只约束生成点，不在前向中强制变换模板生成刚性轴。完整 CAD 使用原始
+`completion_rotation_label`，轴/NOCS 目标使用现有对称规范化 `rotation_label`。
 
-Adam 和 CyclicLR 参数不变，实际学习率范围为 `2e-5 → 5e-4`。冻结 DINO/ULIP
-使用 eval 模式，FD 队列只存 FD 特征。本路径要求完整 CAD 监督，当前旧
-HouseCat6D loader/config 不满足要求；没有保留另一种训练路径。
-旧架构 checkpoint 不能 strict 加载到新架构，需要重新训练。
+当前用户配置 batch size 为 40（30 CAMERA + 10 REAL），保留用户的最新修改。
+Adam 和 CyclicLR 保持不变，学习率范围 `2e-5 → 5e-4`。每 **2 个 epoch** 保存 `epoch_N.pt`，并保存
+匹配的 `tensor_list_epoch_N.pkl` 和更新兼容路径 `tensor_list.pkl`。最后一个 epoch
+也会保存，即使轮数为奇数。测试旧 epoch 时应使用与其匹配的 FD 队列。
+保存的是模型权重和 FD 队列，不是含优化器状态的断点续训包。
 
-## 验证方法
+本次改变了轴头、decoder 和位姿读出方式，旧结构 checkpoint 不能 strict 加载。
+新实验应重新训练，并使用新的实验目录：
 
 ```bash
-.pixi/envs/default/bin/python tools/smoke_completion.py
-.pixi/envs/default/bin/python tools/smoke_completion.py \
-  --fixed-steps 240 --stream-steps 240 --peak-steps 60 --full-steps 5 \
-  --batch-size 40 --output log/axis_frame_smoke
+.pixi/envs/default/bin/python train.py \
+  --config config/REAL/camera_real.yaml --gpus 0 --extra _axis_generation
 ```
 
-使用真实 CAMERA/REAL、完整 DINO/PointNet++/ULIP 和生产 Solver。先固定批次
-检查可学习性，再切换样本和跳到现有调度器最高学习率检查稳定性；没有梯度裁剪
-或降低优化器学习率。日志、指标、权重及 FD 队列保存在对应输出目录。
-冒烟中的固定批次指标只证明短程可学习性；最终精度收益需要完整训练和独立
-REAL275 评估，不能从训练损失下降推断。
+## 本次验证
 
-## 本次实测
+```bash
+.pixi/envs/default/bin/python tools/smoke_completion.py \
+  --fixed-steps 240 --stream-steps 240 --peak-steps 60 --full-steps 5 \
+  --batch-size 40 --output log/axis_generation_smoke_b40
+```
 
-最终 10 维正交标架版本完成 545 步、batch size 40：固定批次 240 步、混合样本
-240 步、最高学习率 60 步、配置批次新样本 5 步。所有损失和梯度有限，各补全
-及轴点模块均收到非零梯度。固定阶段前/后 20 步平均总损失为 **10.302 → 1.859**，
-轴监督为 **0.263 → 0.103**。峰值已分配显存 16.81 GiB。
+真实 CAMERA/REAL、生产 Solver、完整 DINO/PointNet++/ULIP，batch size 40，共 545 步。
+固定批次前/后 20 步平均总损失 **9.964 → 1.867**。所有损失和梯度有限，所有生成
+模块均收到梯度，没有梯度裁剪。最大梯度范数 88.28；最高学习率阶段前/后 20 步
+平均总损失 **1.328 → 0.855**。峰值已分配显存 15.92 GiB。
 
-下表为同一训练探针批次在 eval 模式下的指标，不是独立测试集成绩；末列在全部
-545 步后测量，包含最高学习率压力阶段。旋转误差使用矩阵 Frobenius 范数。
+下表是在同一训练探针批次上的 eval 指标，不是独立测试集成绩。
 
-| 指标 | 初始 | 固定阶段后 | 全部步骤后 |
+| 指标 | 初始 | 固定批次 240 步后 | 全部 545 步后 |
 |---|---:|---:|---:|
-| 稠密平方 Chamfer | 0.005359 | 0.000407 | 0.000419 |
-| 轴点平均距离（m，按对称性屏蔽） | 0.09145 | 0.03182 | 0.02224 |
-| 平移 L2（m） | 0.04687 | 0.02842 | 0.02788 |
-| 尺寸 L2（m） | 0.20440 | 0.08952 | 0.05291 |
-| 旋转矩阵误差 | 2.8123 | 0.4466 | 0.7074 |
+| 平方 Chamfer | 0.005954 | 0.000565 | 0.000526 |
+| 轴点平均距离（m，按对称性屏蔽） | 0.07567 | 0.03854 | 0.02751 |
+| 平移 L2（m） | 0.03690 | 0.02289 | 0.01783 |
+| 尺寸 L2（m） | 0.21357 | 0.07663 | 0.05264 |
+| 旋转矩阵 Frobenius 误差 | 2.68394 | 0.75729 | 0.41267 |
+| NOCS L1 | 0.06133 | 0.09432 | 0.08793 |
 
-最终权重还通过单样本推理、实际 112 点位姿输入、真实 `recon_delta` 恒等式和
-对称轴监督检查。仅反传位姿损失时，轴粗预测/细化/身份编码、共享 decoder、
-关键点细化和 FD 均有梯度；稠密展开头无梯度，确认稠密点没有送入位姿头。
-预测三轴正交误差小于 `6e-7`、公共原点误差小于 `1.2e-7`、基底行列式为 1。
+NOCS 误差尚未低于初始值；当前结果证明短程可学习与数值可运行，不能证明最终
+泛化精度优于旧结构。需要完整训练和 REAL275 评估。
 
-记录：[训练指标](../log/axis_frame_smoke/report.json)、
-[逐步损失](../log/axis_frame_smoke/steps.jsonl)、
-[几何与梯度检查](../log/axis_frame_smoke/geometry_checks.json)。
-冒烟权重和配套 FD 队列位于 `log/axis_frame_smoke/smoke.pt` 与 `tensor_list.pkl`；
-该权重仅用于检查，不替代正式训练的模型。
+针对设计的检查确认：KNN 的查询数仅为 64、轴头输出 144 维独立点坐标、单独位姿
+损失可以训练轴生成头、被 detach 的坐标路径没有梯度、理想轴点可正确读回已知
+位姿，以及第 2 轮和奇数最后一轮能保存权重与配套队列。
+单样本推理检查还覆盖 strict 权重加载、实际 memory/位姿输入点数、合法旋转、
+正尺寸与 `recon_delta` 坐标还原恒等式。本地记录位于
+`log/axis_generation_smoke_b40/report.json`、`steps.jsonl`、`design_checks.json` 和
+`inference_checks.json`；日志目录被 Git 忽略，不包含在仓库中。
+此前 batch size 4 的 545 步检查记录单独保留在 `log/axis_generation_smoke/`。
