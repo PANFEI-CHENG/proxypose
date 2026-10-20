@@ -1,0 +1,131 @@
+setting: supervised
+
+train_dataset:
+  dataset_name: camera_real #camera_real
+  dataset_dir: ./data
+  init_tensor_list_dir: ./tensor_list_nocs.pkl
+  num_mini_batch_per_epoch: 4000
+  image_size: 224       # [192, 224]
+  sample_num: 1024
+  outlier_th: 0.1
+  # syn_bs: 30 #30
+  # real_bs: 10 #10
+  syn_bs: 3 #30
+  real_bs: 1 #10  
+  syn_num_workers: 12
+  real_num_workers: 4
+  shuffle: True
+  drop_last: True
+  pin_memory: True
+
+test_dataset:
+  img_size: 224         # [192, 224]
+  sample_num: 1024
+  dataset_dir: ./data
+  dataset_name: real
+  tensor_list_dir: log/camera_real/ckpt/tensor_list.pkl
+
+
+
+pose_net:
+  rgb_backbone: dino    # [resnet, dino, featup]
+  select_num: 12
+  distillation_feat_dim: 768 #[256(pn),768(pointbert)]
+  cat_num: 6
+  Completion:
+    num_query: 64 # Selected completion keypoints, also used by the pose head.
+    num_missing: 64 # Generated candidates.
+    num_visible: 32 # Visible candidates; 96 candidates -> top 64 keypoints.
+    points_per_keypoint: 16
+    memory_points: 256 # Set to 0 for keypoint-only completion.
+    axis_points_per_axis: 16 # 48 proxy points < 64 completion keypoints.
+    axis_half_length: 0.4
+    encoder_config:
+      embed_dim: 256
+      depth: 2
+      num_heads: 4
+      k: 8
+      n_group: 2
+      mlp_ratio: 2.
+      block_style_list: ['attn-graph', 'attn']
+      combine_style: concat
+    decoder_config:
+      embed_dim: 256
+      depth: 2
+      num_heads: 4
+      k: 8
+      n_group: 2
+      mlp_ratio: 2.
+      self_attn_block_style_list: ['attn-graph', 'attn']
+      self_attn_combine_style: concat
+      cross_attn_block_style_list: ['attn-graph', 'attn']
+      cross_attn_combine_style: concat
+  FDEncoder:
+    feat_dim: 256
+    AttnLayer:
+      block_num: 4
+      d_model: 256
+      dim_ffn: 256
+      num_head: 4
+    SelfAttnLayer:
+      block_num: 2
+      d_model: 256
+      dim_ffn: 256
+      num_head: 4
+  IAKD:
+    kpt_num: 96
+    query_dim: 256
+    AttnLayer:
+      block_num: 4
+      d_model: 256
+      dim_ffn: 256
+      num_head: 4
+  GAFA:
+    block_num: 2
+    K: [16, 32]
+    d_model: 256
+  NOCS_Predictor:
+    cat_num: 6
+    bins_num: 64
+    AttnLayer:
+      block_num: 2
+      d_model: 256
+      dim_ffn: 256
+      num_head: 4
+  
+optimizer:
+  name: Adam
+  lr: 0.01
+  weight_decay: 0
+
+lr_scheduler:
+  name: CyclicLR
+  mode: triangular
+  base_lr: 0.00002
+  max_lr: 0.0005
+  step_size_up: 20000
+  step_size_down: 20000
+  cycle_momentum: False
+
+max_epoch : 30
+
+loss:
+  cd: 2.0
+  nocs: 2.0
+  recon: 15.0
+  delta: 0.05 # Weak regularization of actual local reconstruction offsets.
+  diversity: 10.0
+  pose: 0.3
+  th: 0.01
+  distillation: 0.01 #0.01
+  score: 1.0
+  geo: 1.0
+  score_temperature: 0.05
+  axis: 1.0
+  axis_scale: 0.1
+  symmetric_categories: [0, 1, 3] # bottle, bowl, can; their yaw is unobservable.
+
+rd_seed: 42 #42
+
+per_val: 10  # do the evaluation per per_val epochs 
+per_write: 50  # write down the info per per_write iterations
