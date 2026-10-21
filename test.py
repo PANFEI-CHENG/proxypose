@@ -132,3 +132,7 @@ if __name__ == "__main__":
 
 
 
+# .pixi/envs/default/bin/python test.py \
+#   --config config/REAL/camera_real.yaml \
+#   --extra _completion_axis1020 \
+#   --test_epoch 30
