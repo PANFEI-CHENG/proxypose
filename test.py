@@ -32,6 +32,7 @@ def get_parser():
                         help="gpu num")
     parser.add_argument("--config",
                         type=str,
+                        default="config/REAL/camera_real.yaml",
                         help="path to config file")
     parser.add_argument("--test_epoch",
                         type=int,
@@ -100,7 +101,7 @@ if __name__ == "__main__":
         if not os.path.isdir(save_path):
             os.mkdir(save_path)
 
-        
+        cfg.test_dataset.tensor_list_dir = os.path.join(cfg.ckpt_dir, 'tensor_list.pkl')
         with open(cfg.test_dataset.tensor_list_dir, 'rb') as f:
             tensor_list = cPickle.load(f)
 

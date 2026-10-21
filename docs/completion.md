@@ -60,8 +60,9 @@ target_axes = axis_template * ||size_gt|| @ rotation_gt.T + translation_gt
 
 关键点与轴点特征分别池化，再融合用于修正：旋转采用 `identity6D + 0.1*tanh(residual)`
 构造局部旋转并乘到轴点读取的旋转上；平移修正限制为每分量 `0.1*axis_scale`。
-主要旋转和中心必须由轴结构承担，特征分支负责小幅修正。尺寸用正值形状系数
-乘轴结构尺度预测，三条标准轴的等长不等于物体三边长相等。
+主要旋转和中心必须由轴结构承担，特征分支负责小幅修正。尺寸沿用 CleanPose 的
+三维直接回归 `s = size_estimator(pose_feat)`，不乘轴尺度，也不施加 softplus。
+轴尺度仅用于平移修正的幅度，不约束尺寸输出；轴点自身的尺度监督继续保留。
 
 ## 梯度边界
 
@@ -104,6 +105,9 @@ Adam 和 CyclicLR 保持不变，学习率范围 `2e-5 → 5e-4`。每 **2 个 e
 
 ## 本次验证
 
+下面 545 步记录对应此前的尺寸耦合版本；直接回归尺寸后的调试记录单独保存在
+`log/training_diagnosis_direct_size/`，不能把旧记录当作新版本的测量结果。
+
 ```bash
 .pixi/envs/default/bin/python tools/smoke_completion.py \
   --fixed-steps 240 --stream-steps 240 --peak-steps 60 --full-steps 5 \
@@ -132,8 +136,8 @@ NOCS 误差尚未低于初始值；当前结果证明短程可学习与数值可
 针对设计的检查确认：KNN 的查询数仅为 64、轴头输出 144 维独立点坐标、单独位姿
 损失可以训练轴生成头、被 detach 的坐标路径没有梯度、理想轴点可正确读回已知
 位姿，以及第 2 轮和奇数最后一轮能保存权重与配套队列。
-单样本推理检查还覆盖 strict 权重加载、实际 memory/位姿输入点数、合法旋转、
-正尺寸与 `recon_delta` 坐标还原恒等式。本地记录位于
+当时的单样本推理检查覆盖 strict 权重加载、实际 memory/位姿输入点数、合法旋转、
+正尺寸与 `recon_delta` 坐标还原恒等式（当前直接尺寸回归不再强制正值）。本地记录位于
 `log/axis_generation_smoke_b40/report.json`、`steps.jsonl`、`design_checks.json` 和
 `inference_checks.json`；日志目录被 Git 忽略，不包含在仓库中。
 此前 batch size 4 的 545 步检查记录单独保留在 `log/axis_generation_smoke/`。

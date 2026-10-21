@@ -97,7 +97,8 @@ pose/size head uses **64 completion keypoints + 48 axis points**, with their
 features and separate pooling for the surface and each axis. The dense 1,024
 points are not pose-head inputs. Pose is read from the generated axes and refined
 with small feature-conditioned corrections. Optimizer and LR scheduler settings
-are unchanged. Weights and matching FD queues are saved every two epochs and at
+are unchanged. Size is regressed directly as three components, as in CleanPose,
+without multiplying by the generated axis scale. Weights and matching FD queues are saved every two epochs and at
 the final epoch.
 
 There is one completion/axis path; the old mode switches, native adapter and
@@ -115,6 +116,17 @@ adaptations, and smoke-training results. To reproduce the real-data smoke run:
   --fixed-steps 240 --stream-steps 240 --peak-steps 60 --full-steps 5 \
   --batch-size 40 --output log/axis_generation_smoke_b40
 ```
+
+For a longer convergence diagnosis using the configured batch sizes and learning
+rate schedule, run:
+
+```bash
+.pixi/envs/default/bin/python tools/debug_training.py
+```
+
+This uses 400 fixed-batch steps followed by 800 changing-batch steps and reserves
+disjoint images for a development probe. Per-loss curves, gradient norms, timings
+and TensorBoard events are written to `log/training_diagnosis_direct_size/`.
 
 ## Evaluate 
 - Evaluate on NOCS:
@@ -145,6 +157,17 @@ For visualization, please run
 ```
 python visualize.py --config config/REAL/camera_real.yaml --test_epoch 30
 ```
+
+To randomly visualize the completed object and axis proxy points of a category with Open3D:
+
+```bash
+.pixi/envs/default/bin/python demo_completion_axis.py --category camera
+```
+
+Valid categories are `bottle`, `bowl`, `camera`, `can`, `laptop`, and `mug`.
+Use `--seed 42` for a repeatable sample or `--no-window` to only export PLY files
+under `log/completion_axis_demo/`.
+
 ## Acknowledgements
 Our implementation leverages the code from [DPDN](https://github.com/JiehongLin/Self-DPDN), [AG-Pose](https://github.com/Leeiieeo/AG-Pose) and [GOAT](https://github.com/CrystalSixone/VLN-GOAT). Thank them for their excellent works!
 ## Citation

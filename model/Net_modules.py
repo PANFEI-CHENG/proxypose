@@ -527,6 +527,6 @@ class PoseSizeEstimator(nn.Module):
         residual = residual + residual.new_tensor([1., 0., 0., 0., 1., 0.])
         r = axis_rotation @ Ortho6d2Mat(residual[:, :3], residual[:, 3:])
         t = axis_center + 0.1 * axis_scale * self.translation_estimator(pose_feat).tanh()
-        s = axis_scale * F.softplus(self.size_estimator(pose_feat))
+        s = self.size_estimator(pose_feat)
         return r,t,s
     
