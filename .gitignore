@@ -1,5 +1,5 @@
 # Local environments and caches (keep pixi.toml and pixi.lock)
-.pixi/
+.pixi
 .venv/
 venv/
 __pycache__/
@@ -26,7 +26,7 @@ events.out.tfevents.*
 *.log
 
 # Model weights, feature queues and serialized data
-pretrained_model/
+pretrained_model
 pretrained_models/
 checkpoints/
 ckpt/
@@ -82,3 +82,6 @@ Thumbs.db
 *.swp
 *.swo
 *~
+
+# Local agent worktrees (separate Git working copies)
+/.claude/worktrees/
