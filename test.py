@@ -36,8 +36,8 @@ def get_parser():
                         help="path to config file")
     parser.add_argument("--test_epoch",
                         type=int,
-                        default=30,
-                        help="test epoch")
+                        default=50,
+                        help="test epoch (the last one is max_epoch)")
     parser.add_argument("--cat_id",
                         type=int,
                         default=-1,

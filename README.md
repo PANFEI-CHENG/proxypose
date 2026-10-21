@@ -100,10 +100,14 @@ layer. For bottle/bowl/can, the GT yaw is aligned to the prediction in closed fo
 so all three axes are supervised. R and t come from `self.estimator` and use only
 the proxies: the pose is solved from the **detached** proxies and their object-frame
 template coordinates, then refined with small corrections from the proxy features.
+The pose loss aligns the GT yaw of bottle/bowl/can to the prediction in the same
+closed form, because their canonical yaw label is not consistent under rotation
+augmentation and the benchmark only measures their y-axis.
 There is no keypoint NOCS branch. Size is estimated SecondPose-style: each of
 the 64 completion keypoints votes a category-specific size from its decoder feature,
 and the votes are averaged. Training uses AdamW (peak LR 5e-4, weight decay 0.05,
-none on biases/norm weights), one epoch of linear warmup, cosine decay to 1e-6 and
+none on biases/norm weights), one epoch of linear warmup, cosine decay to 1e-6 over
+50 epochs × 4000 iterations (200k, the iteration count of ComPose) and
 gradient-norm clipping at 20. Weights and matching FD queues are saved every two
 epochs and at the final epoch.
 

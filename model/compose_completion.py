@@ -204,6 +204,22 @@ def axis_target(pred, template, rotation, translation, size, symmetric):
     return canonical_to_camera(template, rotation @ turn, translation, size)
 
 
+def align_symmetric_rotation(pred, rotation, symmetric):
+    """GT rotation for the pose loss. For y-symmetric objects the GT frame is turned about
+    its y-axis by the yaw closest to `pred`, as for the proxy targets above.
+
+    The canonical yaw of these labels is defined relative to the camera, which the in-network
+    rotation augmentation breaks; the benchmark measures only their y-axis. With
+    M = R_gt^T R_pred, tr(R_y(yaw)^T M) is maximized by yaw = atan2(M02 - M20, M00 + M22).
+    """
+    with torch.no_grad():
+        m = rotation.transpose(1, 2) @ pred
+        yaw = torch.atan2(m[:, 0, 2] - m[:, 2, 0], m[:, 0, 0] + m[:, 2, 2]) * symmetric
+        cos, sin, zero, one = yaw.cos(), yaw.sin(), torch.zeros_like(yaw), torch.ones_like(yaw)
+        turn = torch.stack((cos, zero, sin, zero, one, zero, -sin, zero, cos), dim=1).view(-1, 3, 3)
+        return rotation @ turn
+
+
 def axis_proxy_loss(layers, template, rotation, translation, size, symmetric):
     """Proxy distance in units of the object scale, summed over decoder layers."""
     scale = size.norm(dim=-1).clamp_min(1e-8)

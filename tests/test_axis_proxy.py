@@ -1,4 +1,4 @@
-"""Checks for axis-proxy supervision, the proxy pose readout and the LR schedule.
+"""Checks for axis-proxy supervision, the pose-loss yaw alignment, the proxy pose readout and the LR schedule.
 
 Run: .pixi/envs/default/bin/python tests/test_axis_proxy.py
 """
@@ -14,7 +14,7 @@ import torch
 from easydict import EasyDict
 from torch import nn
 
-from model.compose_completion import axis_target, canonical_to_camera
+from model.compose_completion import align_symmetric_rotation, axis_target, canonical_to_camera
 from utils.solver import build_optimizer, build_lr_scheduler
 
 CFG = gorilla.Config.fromfile(str(ROOT / 'config/REAL/camera_real.yaml'))
@@ -77,6 +77,21 @@ def test_warmup_cosine_schedule():
     assert all(a >= b for a, b in zip(lrs[warmup:], lrs[warmup + 1:]))
     assert math.isclose(lrs[total], CFG.lr_scheduler.min_lr) and math.isclose(lrs[-1], CFG.lr_scheduler.min_lr)
 
+
+
+def test_pose_loss_rotation_alignment():
+    rotation = random_pose(64)[0]
+    symmetric = torch.arange(64) % 2 == 0
+    # A prediction that differs from GT only by yaw is matched exactly for symmetric objects.
+    pred = rotation @ yaw((torch.rand(64) * 2 - 1) * math.pi)
+    aligned = align_symmetric_rotation(pred, rotation, symmetric)
+    torch.testing.assert_close(aligned[symmetric], pred[symmetric], atol=1e-5, rtol=0)
+    assert torch.equal(aligned[~symmetric], rotation[~symmetric])
+    # For any prediction the y-axis is unchanged and the target is never farther than GT.
+    pred = random_pose(64)[0]
+    aligned = align_symmetric_rotation(pred, rotation, symmetric)
+    torch.testing.assert_close(aligned[:, :, 1], rotation[:, :, 1], atol=1e-5, rtol=0)
+    assert ((pred - aligned).norm(dim=(1, 2)) <= (pred - rotation).norm(dim=(1, 2)) + 1e-5).all()
 
 def test_readout_recovers_pose_from_ideal_proxies():
     if not torch.cuda.is_available():  # rotation_utils.normalize_vector requires CUDA

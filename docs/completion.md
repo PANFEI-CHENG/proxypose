@@ -88,6 +88,23 @@ R 和 t 只由 48 个代理点及其模板物体坐标（代理点的 NOCS）求
 
 代理点在进入 estimator 前 **detach**：位姿损失只训练修正分支和代理点特征，不移动代理点。
 
+### 对称类别的位姿损失
+
+瓶/碗/罐的 `rotation_label` 按 DPDN 的方式规范化 yaw：选取使旋转矩阵 x-z 块对称的
+yaw，这个定义依赖相机坐标系。网络内的 ±20° 旋转增强改变了点云相对相机的朝向，但
+标签的规范 yaw 没有随之重新定义，所以对这三类，`loss_pose` 的 x/z 列监督的是一个
+带噪声、且 benchmark 不测量的 yaw（对称类别只评估 y 轴）。
+
+因此位姿损失与代理点损失一样，先把 GT 绕自身 Y 轴转到与预测最吻合的 yaw
+（`align_symmetric_rotation`，闭式解），再计算 `PoseDis`。记 `M = R_gtᵀ R_pred`：
+
+```text
+ψ = atan2(M02 − M20, M00 + M22),   R_target = R_gt · R_y(ψ)
+```
+
+y 轴不变，非对称类别不受影响，对齐后的目标离预测不会比原 GT 更远。效果上等价于
+GPV-Pose / HS-Pose 对对称类别只监督对称轴的做法。
+
 ## 尺寸：SecondPose 的 t/s 分支结构
 
 尺寸不再由 estimator 回归，而由 `SizeEstimator` 从补全关键点及其特征估计。结构对应
@@ -114,7 +131,19 @@ SecondPose/VI-Net `PN2.Net` 中 `s_mlp` 的末端：
 
 AdamW（betas 0.9 / 0.999，weight decay 0.05；bias 和归一化层权重等 1 维参数不衰减），
 按 iteration 调度：线性 warmup 4000 iter（1 个 epoch，从 0.001×lr 起）到峰值 5e-4，
-再余弦衰减到 1e-6，总长 `max_epoch × num_mini_batch_per_epoch = 30 × 4000`。
+再余弦衰减到 1e-6，总长 `max_epoch × num_mini_batch_per_epoch = 50 × 4000`（200k iter）。
+
+训练长度从 30 个 epoch 增加到 50 个：
+
+- 之前 30 epoch 的完整训练（旧结构、CyclicLR，每 10 epoch 一个周期）在每个周期的 lr
+  最低点，总训练损失依次为 0.276 / 0.252 / 0.238（REAL 部分 0.246 / 0.220 / 0.211），
+  到第 30 个 epoch 仍在下降，没有饱和。
+- 对比方法的训练量：CleanPose 为 120k iter × batch 24，ComPose 为 200k iter × batch 24。
+  50 epoch 与 ComPose 的 iteration 数相同；按 batch 40 计，样本数是 ComPose 的 1.7 倍。
+- 代价：每 epoch 约 21 分钟，50 epoch 约 18 小时。
+- 风险：REAL 训练集只有约 4300 张，50 epoch 中每张约被看 470 次。每 2 个 epoch 保存的
+  checkpoint 可以用来检查后期 REAL275 是否下降；但余弦日程下中间 checkpoint 没有退火完，
+  不能直接当作"更短训练"的结果。
 全局梯度范数裁剪 `grad_clip: 20`：warmup 之后梯度范数中位数约 10，只有离群 batch
 （下文的 CAMERA 补全 Chamfer 尖峰）会被裁剪。
 gorilla 的构建器不能设置参数组，所以 `utils/solver.py` 中的 Solver 自己构建 AdamW 和
@@ -130,8 +159,8 @@ gorilla 的构建器不能设置参数组，所以 `utils/solver.py` 中的 Solv
 recon_model = pred_kpt_3d.repeat_interleave(16, dim=1) + recon_delta
 ```
 
-完整 CAD 使用原始 `completion_rotation_label`，代理点目标使用现有对称规范化的
-`rotation_label`。
+完整 CAD 使用原始 `completion_rotation_label`；代理点目标和位姿损失使用对称规范化的
+`rotation_label`，并对瓶/碗/罐做上述 yaw 对齐。
 
 学习率按 batch size 40（30 CAMERA + 10 REAL）选择。每 **2 个 epoch** 保存 `epoch_N.pt`，
 并保存匹配的 `tensor_list_epoch_N.pkl` 和更新兼容路径 `tensor_list.pkl`。最后一个 epoch
@@ -149,7 +178,8 @@ recon_model = pred_kpt_3d.repeat_interleave(16, dim=1) + recon_delta
 ## 本次验证
 
 `tests/test_axis_proxy.py` 检查：对称 yaw 对齐对任意 yaw 都能精确还原预测、非对称目标
-等于 GT、对齐后的目标不会比 GT 更远、理想代理点经 estimator 读回 GT 位姿（误差 < 1e-5）、
+等于 GT、对齐后的目标不会比 GT 更远、位姿损失的旋转对齐（只差 yaw 时精确还原、y 轴不变、
+非对称类别不变、不比 GT 更远）、理想代理点经 estimator 读回 GT 位姿（误差 < 1e-5）、
 学习率曲线（warmup 起点、峰值、单调衰减、终点 min_lr）和不衰减参数组：
 
 ```bash
@@ -189,3 +219,33 @@ CAMERA 探针（120 张）趋势相同：5°2cm 依次为 5.8%、50.0%、48.3%�
 5°2cm 52.5%（原 57.5%）、10°5cm 80.0%（原 92.5%）。REAL 两次带 NOCS 的运行之间也差了
 10 个百分点，所以这些差别都在 40 张图的波动范围内；前期收敛更快（第 500 iter 代理点
 误差 2.5–2.7 cm，原 3.0–3.4 cm）。是否有影响需要完整训练和 REAL275 测试确认。
+
+### 小批量 A/B（2026-10-21）
+
+GPU 上同时有另一组 3000 步实验，所以用缩小的设置：batch 9 CAMERA + 3 REAL、1500 iter
+（150 iter warmup + 余弦，峰值 5e-4，裁剪 20），验证集与 3000 步协议相同（REAL 训练集
+scene_7 整个场景移出训练、探针 400 张；CAMERA 移出 400 张）。这只是训练早期（约 1.8 万个
+样本）的比较，数字远低于完整训练，也不是 REAL275 测试集结果。
+
+| 运行 | CAMERA 5°2cm | CAMERA 旋转中位数 | 代理点 line cm | REAL 5°2cm | CAMERA 瓶/碗/罐 5°2cm |
+|---|---:|---:|---:|---:|---|
+| 基线 seed 42 | 12.7% | 12.5° | 2.88 | 8.0% | 15 / 18 / 34 |
+| 基线 seed 7 | 9.0% | 14.9° | 2.74 | 3.2% | 18 / 11 / 17 |
+| **位姿损失 yaw 对齐** seed 42 | 27.8% | 8.3° | 2.04 | 16.2% | 64 / 35 / 48 |
+| **位姿损失 yaw 对齐** seed 7 | 26.0% | 9.9° | 2.64 | 14.5% | 47 / 40 / 51 |
+
+两个种子上，对齐都使 CAMERA 5°2cm 提高 15 个百分点以上，增益主要来自对称类别；
+相机/笔记本/杯子在这个阶段仍未收敛（旋转中位数约 40–50°），seed 42 上它们的改善在
+seed 7 上没有复现。最后 300 iter 的 `loss_axis` 也更低（0.42 / 0.52，基线 0.58 / 0.56），
+说明去掉 yaw 标签噪声后，经代理点特征回传到共享特征的位姿梯度更干净。
+
+同一设置下还试过两个结构改动，都没有保留：
+
+- **规范坐标系位姿精修**：用代理点位姿把观测点变换到物体坐标系（按尺寸归一化），
+  点网络预测残差 R/t。与对齐组合时 CAMERA 5°2cm 为 19.0%（只对齐为 27.8%），代理点
+  误差 2.71 cm（2.04 cm）；同一运行内精修前后旋转中位数 11.64° → 11.57°，几乎没有改善。
+  把精修的输入特征 detach 后（精修无法影响共享网络）仍为 17.5%，所以是精修输出本身
+  变差（主要在对称类别），而不是它的梯度损害了共享特征。另外，这次运行的代理点误差为
+  2.63 cm，说明仅随机数顺序不同，代理点误差就有约 ±0.3 cm 的波动。
+- **代理点迭代精修**（Deformable-DETR 式，层间用当前估计重新编码查询、后层回归偏移）：
+  在精修 + 对齐之上再加入时，代理点误差 2.71 → 3.12 cm。

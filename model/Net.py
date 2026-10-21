@@ -8,7 +8,7 @@ from model.modules import ModifiedResnet, PointNet2MSG
 from model.Net_modules import (InstanceAdaptiveKeypointDetector, GeometricAwareFeatureAggregator,
                                FrontDoorEncoder, PoseEstimator, SizeEstimator)
 from model.compose_completion import (ComposeCompletion, ComposeCompletionLoss, canonical_to_camera,
-                                     axis_proxy_loss)
+                                     axis_proxy_loss, align_symmetric_rotation)
 from utils.data_utils import generate_augmentation
 
 
@@ -126,8 +126,9 @@ class Loss(nn.Module):
         score = completion.pop('loss_score')
         symmetric = (e['category_label'].reshape(-1, 1) == self.symmetric_categories).any(1)
         axis_loss = axis_proxy_loss(e['axis_layers'], e['axis_nocs'], rotation, translation, size, symmetric)
+        pose_rotation = align_symmetric_rotation(e['pred_rotation'], rotation, symmetric)
         losses = {
-            'loss_pose': cfg.pose * PoseDis(e['pred_rotation'], e['pred_translation'], e['pred_size'], rotation, translation, size),
+            'loss_pose': cfg.pose * PoseDis(e['pred_rotation'], e['pred_translation'], e['pred_size'], pose_rotation, translation, size),
             'loss_cd': cfg.cd * torch.cdist(e['pts'], e['observed_kpt_3d']).amin(1).mean(),
             'loss_diversity': cfg.diversity * self.diversity_loss(e['observed_kpt_3d']),
             'loss_recon': cfg.recon * sum(completion.values()),

@@ -93,7 +93,7 @@ lr_scheduler:
 
 grad_clip: 20.0 # max global grad norm; after warmup only outlier batches (median ~10) reach it
 
-max_epoch : 30
+max_epoch : 50 # 200k iterations of batch 40, the iteration count of ComPose
 
 loss:
   cd: 2.0
