@@ -78,34 +78,25 @@ pose_net:
     block_num: 2
     K: [16, 32]
     d_model: 256
-  NOCS_Predictor:
-    cat_num: 6
-    bins_num: 64
-    AttnLayer:
-      block_num: 2
-      d_model: 256
-      dim_ffn: 256
-      num_head: 4
-  
+
 optimizer:
-  name: Adam
-  lr: 0.01
-  weight_decay: 0
+  name: AdamW
+  lr: 0.0005           # peak LR, reached at the end of warmup
+  betas: [0.9, 0.999]
+  weight_decay: 0.05   # not applied to biases and normalization weights
 
 lr_scheduler:
-  name: CyclicLR
-  mode: triangular
-  base_lr: 0.00002
-  max_lr: 0.0005
-  step_size_up: 20000
-  step_size_down: 20000
-  cycle_momentum: False
+  name: WarmupCosine   # per-iteration, over max_epoch * num_mini_batch_per_epoch (utils/solver.py)
+  warmup_iters: 4000   # one epoch of linear warmup
+  warmup_factor: 0.001
+  min_lr: 0.000001
+
+grad_clip: 20.0 # max global grad norm; after warmup only outlier batches (median ~10) reach it
 
 max_epoch : 30
 
 loss:
   cd: 2.0
-  nocs: 2.0
   recon: 15.0
   delta: 0.05 # Weak regularization of actual local reconstruction offsets.
   diversity: 10.0
@@ -113,11 +104,8 @@ loss:
   th: 0.01
   distillation: 0.01 #0.01
   score: 1.0
-  geo: 1.0
   score_temperature: 0.05
-  axis: 1.0
-  axis_scale: 0.1
-  axis_structure: 0.05 # Soft line, common-center and orthogonality priors.
+  axis: 2.0 # Scale-normalized proxy distance, summed over decoder layers.
   symmetric_categories: [0, 1, 3] # bottle, bowl, can; their yaw is unobservable.
 
 rd_seed: 42 #42

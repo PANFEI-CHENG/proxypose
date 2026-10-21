@@ -80,24 +80,18 @@ def main():
         data = {k: torch.cat([part[k] for part in fixed]).cuda() for k in fixed[0]}
         with torch.no_grad():
             prediction = model(data)
-            scale = data['size_label'].norm(dim=1)[:, None, None]
-            from model.compose_completion import canonical_to_camera, chamfer_squared
+            from model.compose_completion import axis_target, canonical_to_camera, chamfer_squared
             target = canonical_to_camera(data['model'], data['completion_rotation_label'],
                                          data['translation_label'], data['size_label'])
-            nocs = (prediction['pred_kpt_3d'] - data['translation_label'][:, None]) / scale @ data['rotation_label']
-            axis_target = canonical_to_camera(prediction['axis_nocs'], data['rotation_label'],
-                                             data['translation_label'], data['size_label'])
-            weights = torch.ones(data['pts'].size(0), 3, device='cuda')
             symmetric = (data['category_label'].reshape(-1, 1) == loss_fn.symmetric_categories).any(1)
-            weights[symmetric] = weights.new_tensor([0., 1., 0.])
-            axis_error = (prediction['axis_points'] - axis_target).norm(dim=-1).reshape(-1, 3, model.completion.axis_points).mean(2)
+            axes = axis_target(prediction['axis_points'], prediction['axis_nocs'], data['rotation_label'],
+                               data['translation_label'], data['size_label'], symmetric)
             result = {
                 'dense_cd_squared': chamfer_squared(prediction['recon_model'], target).item(),
-                'nocs_l1': (prediction['kpt_nocs'] - nocs).abs().mean().item(),
                 'translation_l2': (prediction['pred_translation'] - data['translation_label']).norm(dim=1).mean().item(),
                 'size_l2': (prediction['pred_size'] - data['size_label']).norm(dim=1).mean().item(),
                 'rotation_frobenius': (prediction['pred_rotation'] - data['rotation_label']).norm(dim=(1, 2)).mean().item(),
-                'axis_l2': ((axis_error * weights).sum(1) / weights.sum(1)).mean().item(),
+                'axis_l2': (prediction['axis_points'] - axes).norm(dim=-1).mean().item(),
                 'recon_delta_norm': prediction['recon_delta'].norm(dim=-1).mean().item(),
             }
             torch.testing.assert_close(prediction['recon_model'], prediction['pred_kpt_3d'].repeat_interleave(
@@ -115,10 +109,10 @@ def main():
             # Solver adds predictions to its input dictionaries; use fresh ones.
             loss, info, _ = solver.step_camera_real(tuple(dict(x) for x in batch), 'train')
             loss.backward()
-            norm = torch.nn.utils.clip_grad_norm_(parameters, float('inf'), error_if_nonfinite=True)
+            norm = torch.nn.utils.clip_grad_norm_(parameters, cfg.get('grad_clip') or float('inf'), error_if_nonfinite=True)
             if not history:
-                for name in ('encoder', 'decoder', 'missing_head', 'score_head', 'refine_head',
-                             'fold_head', 'keypoint_proj', 'axis_head', 'axis_embed', 'axis_refine_head'):
+                for name in ('decoder', 'missing_head', 'score_head', 'refine_head',
+                             'fold_head', 'keypoint_proj', 'axis_head', 'axis_embed'):
                     module = getattr(model.completion, name)
                     gradient_checks[name] = sum(p.grad.abs().sum().item() for p in module.parameters() if p.grad is not None)
                 assert all(value > 0 for value in gradient_checks.values()), gradient_checks
@@ -140,9 +134,10 @@ def main():
             if index >= args.stream_steps:
                 break
             step(batch, 'stream', index)
-        # Probe the existing schedule's maximum LR without changing its settings.
+        # Probe the schedule's peak LR, reached at the end of warmup, without changing its settings.
         if args.peak_steps:
-            solver.lr_scheduler.step(scheduler_settings['step_size_up'])
+            solver.lr_scheduler.last_epoch = scheduler_settings['warmup_iters'] - 1
+            solver.lr_scheduler.step()
         for index in range(args.peak_steps):
             step(fixed, 'peak_lr', index)
         if args.full_steps:

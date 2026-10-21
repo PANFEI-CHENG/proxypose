@@ -441,9 +441,9 @@ class InstanceAdaptiveKeypointDetector(nn.Module):
         
         return batch_kpt_query, heatmap
         
-class PoseSizeEstimator(nn.Module):
+class PoseEstimator(nn.Module):
     def __init__(self, axis_points_per_axis):
-        super(PoseSizeEstimator, self).__init__()
+        super(PoseEstimator, self).__init__()
         self.axis_points = axis_points_per_axis
         
         self.pts_mlp1 = nn.Sequential(
@@ -470,7 +470,7 @@ class PoseSizeEstimator(nn.Module):
             nn.Conv1d(512, 512, 1),
             nn.ReLU(),
         )
-        self.group_fusion = nn.Sequential(nn.Linear(512 * 4, 512), nn.ReLU())
+        self.group_fusion = nn.Sequential(nn.Linear(512 * 3, 512), nn.ReLU())
         self.rotation_estimator = nn.Sequential(
             nn.Linear(512, 512),
             nn.ReLU(),
@@ -485,48 +485,83 @@ class PoseSizeEstimator(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 3),
         )
-        self.size_estimator = nn.Sequential(
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 3),
-        )
         for head in (self.rotation_estimator, self.translation_estimator):
             nn.init.normal_(head[-1].weight, std=0.001)
             nn.init.zeros_(head[-1].bias)
-        
+
     def forward(self, pts1, pts2, pts1_local):#, kpt_normal
-        # Read the pose FROM generated ordered axis points, before feature refinement.
-        axes_xyz = pts1[:, -3 * self.axis_points:].reshape(-1, 3, self.axis_points, 3)
-        ticks = pts2[:, -3 * self.axis_points:-2 * self.axis_points, 0]
+        """
+        Solve the pose from the camera-frame axis proxies and their object-frame
+        template coordinates, then refine it with the proxy features.
+
+        Args:
+            pts1:       (b, 3*axis_points, 3) camera-frame proxies, detached by the caller
+            pts2:       (b, 3*axis_points, 3) object-frame template, ordered x, y, z axis
+            pts1_local: (b, 3*axis_points, c) proxy features
+        """
+        axes_xyz = pts1.reshape(-1, 3, self.axis_points, 3)
+        ticks = pts2[:, :self.axis_points, 0]
         axis_center = axes_xyz.mean((1, 2))
         vectors = ((axes_xyz - axis_center[:, None, None]) * ticks[:, None, :, None]).sum(2)
         vectors = vectors / ticks.square().sum(1)[:, None, None]
         axis_rotation = Ortho6d2Mat(vectors[:, 0], vectors[:, 1])
         axis_scale = vectors.norm(dim=-1).mean(1, keepdim=True).clamp_min(1e-4)
-        # Feature losses do not move points via positional inputs; the geometric
-        # readout above deliberately remains differentiable into the axis generator.
+        # Feature losses do not move points via positional inputs.
         pts1 = self.pts_mlp1(pts1.detach().transpose(1,2))
         pts2 = self.pts_mlp2(pts2.detach().transpose(1,2))
         pose_feat = torch.cat([pts1, pts1_local.transpose(1,2), pts2], dim=1) # b, c, n
 
         pose_feat = self.pose_mlp1(pose_feat) # b, c, n
-        split = pose_feat.size(2) - 3 * self.axis_points
-        surface = pose_feat[:, :, :split].mean(2, keepdim=True)
-        axes = pose_feat[:, :, split:].mean(2, keepdim=True)
-        pose_global = 0.5 * (surface + axes)
+        pose_global = pose_feat.mean(2, keepdim=True)
         pose_feat = torch.cat([pose_feat, pose_global.expand_as(pose_feat)], 1) # b, 2c, n
         pose_feat = self.pose_mlp2(pose_feat)
-        surface = pose_feat[:, :, :split].mean(2)
-        axes = pose_feat[:, :, split:].reshape(-1, 512, 3, self.axis_points).mean(3).flatten(1)
-        pose_feat = self.group_fusion(torch.cat((surface, axes), dim=1))
+        # One pooled feature per axis keeps the axis identity.
+        axes = pose_feat.reshape(-1, 512, 3, self.axis_points).mean(3).flatten(1)
+        pose_feat = self.group_fusion(axes)
 
         # Small corrections keep generated axes responsible for the main pose.
         residual = 0.1 * self.rotation_estimator(pose_feat).tanh()
         residual = residual + residual.new_tensor([1., 0., 0., 0., 1., 0.])
         r = axis_rotation @ Ortho6d2Mat(residual[:, :3], residual[:, 3:])
         t = axis_center + 0.1 * axis_scale * self.translation_estimator(pose_feat).tanh()
-        s = self.size_estimator(pose_feat)
-        return r,t,s
-    
+        return r,t
+
+
+class SizeEstimator(nn.Module):
+    """SecondPose (VI-Net) t/s head for size: every keypoint votes a
+    category-specific size and the votes are averaged."""
+    def __init__(self, feat_dim, cat_num):
+        super(SizeEstimator, self).__init__()
+        self.cat_num = cat_num
+
+        self.pts_mlp = nn.Sequential(
+            nn.Conv1d(3, 32, 1),
+            nn.ReLU(),
+            nn.Conv1d(32, 64, 1),
+            nn.ReLU(),
+        )
+        self.s_mlp = nn.Sequential(
+            nn.Conv1d(feat_dim + 64, 256, 1),
+            nn.BatchNorm1d(256),
+            nn.ReLU(),
+            nn.Conv1d(256, 128, 1),
+            nn.BatchNorm1d(128),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Conv1d(128, 3 * cat_num, 1),
+        )
+
+    def forward(self, kpt_3d, kpt_feature, cls):
+        """
+        Args:
+            kpt_3d:      (b, kpt_num, 3)
+            kpt_feature: (b, kpt_num, dim)
+            cls:         (b, )
+        Returns:
+            s:           (b, 3)
+        """
+        b, kpt_num, _ = kpt_3d.shape
+        feat = torch.cat([self.pts_mlp(kpt_3d.transpose(1, 2)), kpt_feature.transpose(1, 2)], dim=1)
+        s = self.s_mlp(feat).view(b, self.cat_num, 3, kpt_num).mean(3)
+        return s.gather(1, cls.view(b, 1, 1).expand(-1, 1, 3)).squeeze(1)
+

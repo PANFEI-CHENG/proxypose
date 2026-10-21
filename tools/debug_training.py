@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from tools.smoke_completion import (seed, Net, Loss, Solver, create_dataloaders,
                                     load_ULIP_Pointbert, gorilla, np, torch)
-from model.compose_completion import canonical_to_camera, chamfer_squared
+from model.compose_completion import axis_target, canonical_to_camera, chamfer_squared
 
 
 def plot_training(output):
@@ -30,9 +30,9 @@ def plot_training(output):
     fig, axes = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
     for ax, names, title in zip(axes[0], (
             ('loss_all', 'loss_diversity', 'loss_distillation'),
-            ('loss_pose', 'loss_axis', 'loss_axis_structure'),
-            ('loss_recon', 'loss_nocs')),
-            ('Total and auxiliary losses', 'Pose and axis losses', 'Completion and NOCS losses')):
+            ('loss_pose', 'loss_axis'),
+            ('loss_recon', 'loss_score')),
+            ('Total and auxiliary losses', 'Pose and axis losses', 'Completion losses')):
         for name in names:
             values = np.array([r[name] for r in rows])
             window = min(20, len(values))
@@ -43,15 +43,15 @@ def plot_training(output):
         ax.set_yscale('log')
     for split in ('fixed', 'heldout'):
         axes[1, 0].plot(probe_steps, [p[split]['rotation_deg'] for p in probes], 'o-', label=split)
-        axes[1, 2].plot(probe_steps, [p[split]['nocs_relative_error'] for p in probes], 'o-', label=split)
+        axes[1, 2].plot(probe_steps, [p[split]['axis_cm'] for p in probes], 'o-', label=split)
     axes[1, 0].set_title('Rotation error (symmetry-aware)')
     axes[1, 0].set_ylabel('Degrees')
     for name in ('translation_cm', 'size_cm', 'axis_cm'):
         axes[1, 1].plot(probe_steps, [p['heldout'][name] for p in probes], 'o-', label=name.removesuffix('_cm'))
     axes[1, 1].set_title('Disjoint-image development probe')
     axes[1, 1].set_ylabel('cm')
-    axes[1, 2].axhline(1, color='gray', ls=':', label='Zero-coordinate baseline')
-    axes[1, 2].set_title('NOCS error / zero-coordinate error')
+    axes[1, 2].set_title('Axis proxy error (symmetry-aligned)')
+    axes[1, 2].set_ylabel('cm')
     for ax in axes.flat:
         ax.axvline(report['args']['fixed_steps'], color='gray', ls='--', alpha=.6)
         ax.set_xlabel('Optimizer step')
@@ -98,28 +98,21 @@ def main():
     solver = Solver(model, loss_fn, loaders, logger, cfg)
     writer = solver.tb_writer.writer
     parameters = [p for p in model.parameters() if p.requires_grad]
-    modules = dict(IAKD=model.IAKD, FD=model.FD_Encoder, NOCS=model.nocs_predictor, pose=model.estimator)
+    modules = dict(IAKD=model.IAKD, FD=model.FD_Encoder, pose=model.estimator, size=model.size_estimator)
     modules.update({name: getattr(model.completion, name) for name in
-                    ('encoder', 'decoder', 'missing_head', 'score_head', 'refine_head', 'fold_head',
-                     'axis_head', 'axis_refine_head', 'axis_embed')})
+                    ('decoder', 'missing_head', 'score_head', 'refine_head', 'fold_head',
+                     'axis_head', 'axis_embed')})
     rows, evaluations, gradients = [], [], []
 
     @torch.no_grad()
     def evaluate(batch):
         data = {k: torch.cat([part[k] for part in batch]).cuda() for k in batch[0]}
         pred = model(data)
-        scale = data['size_label'].norm(dim=1)[:, None, None]
         target = canonical_to_camera(data['model'], data['completion_rotation_label'],
                                      data['translation_label'], data['size_label'])
-        nocs_target = (pred['pred_kpt_3d'] - data['translation_label'][:, None]) / scale @ data['rotation_label']
-        nocs_error = (pred['pred_kpt_nocs'] - nocs_target).abs().mean()
-        nocs_zero = nocs_target.abs().mean()
-        axes_target = canonical_to_camera(pred['axis_nocs'], data['rotation_label'],
-                                          data['translation_label'], data['size_label'])
         symmetric = (data['category_label'].reshape(-1, 1) == loss_fn.symmetric_categories).any(1)
-        weights = torch.ones(data['pts'].size(0), 3, device='cuda')
-        weights[symmetric] = weights.new_tensor([0., 1., 0.])
-        axis_error = (pred['axis_points'] - axes_target).norm(dim=-1).reshape(-1, 3, model.completion.axis_points).mean(2)
+        axes_target = axis_target(pred['axis_points'], pred['axis_nocs'], data['rotation_label'],
+                                  data['translation_label'], data['size_label'], symmetric)
         rotation = pred['pred_rotation'] @ data['rotation_label'].transpose(1, 2)
         angle = ((rotation.diagonal(dim1=1, dim2=2).sum(1) - 1) / 2).clamp(-1, 1).acos()
         y_angle = (pred['pred_rotation'][:, :, 1] * data['rotation_label'][:, :, 1]).sum(1).clamp(-1, 1).acos()
@@ -128,10 +121,7 @@ def main():
                     translation_cm=100 * (pred['pred_translation']-data['translation_label']).norm(dim=1).mean().item(),
                     size_cm=100 * (pred['pred_size']-data['size_label']).norm(dim=1).mean().item(),
                     rotation_deg=angle.mean().item(),
-                    axis_cm=100 * ((axis_error * weights).sum(1) / weights.sum(1)).mean().item(),
-                    nocs_l1=nocs_error.item(), nocs_zero_baseline=nocs_zero.item(),
-                    nocs_relative_error=(nocs_error / nocs_zero.clamp_min(1e-8)).item(),
-                    nocs_unrepresentable_fraction=(nocs_target.abs() > (0.5 - 0.5/64)).float().mean().item())
+                    axis_cm=100 * (pred['axis_points'] - axes_target).norm(dim=-1).mean().item())
 
     def probe(phase, step):
         # Probes do not alter training RNG or the FD queue; cached images are fixed.
@@ -153,7 +143,7 @@ def main():
         solver.optimizer.zero_grad(set_to_none=True)
         loss, info, _ = solver.step_camera_real(tuple(dict(x) for x in batch), 'train')
         loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(parameters, float('inf'), error_if_nonfinite=True)
+        norm = torch.nn.utils.clip_grad_norm_(parameters, cfg.get('grad_clip') or float('inf'), error_if_nonfinite=True)
         step = len(rows) + 1
         if step == 1 or step % 200 == 0:
             record = dict(step=step, norms={name: sum(p.grad.square().sum().item() for p in module.parameters()
@@ -171,7 +161,7 @@ def main():
             for k,v in row.items():
                 if k != 'phase': writer.add_scalar(f'train/{k}',v,step)
             print(f"{phase} {step}: loss={info['loss_all']:.4f} pose={info['loss_pose']:.4f} "
-                  f"axis={info['loss_axis']:.4f} nocs={info['loss_nocs']:.4f} "
+                  f"axis={info['loss_axis']:.4f} "
                   f"recon={info['loss_recon']:.4f} grad={norm.item():.2f}",flush=True)
 
     probe('initial',0)

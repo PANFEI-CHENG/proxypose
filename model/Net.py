@@ -3,13 +3,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from model.losses import PoseDis, SmoothL1Dis
+from model.losses import PoseDis
 from model.modules import ModifiedResnet, PointNet2MSG
 from model.Net_modules import (InstanceAdaptiveKeypointDetector, GeometricAwareFeatureAggregator,
-                               FrontDoorEncoder, PoseSizeEstimator, NOCS_Predictor)
+                               FrontDoorEncoder, PoseEstimator, SizeEstimator)
 from model.compose_completion import (ComposeCompletion, ComposeCompletionLoss, canonical_to_camera,
-                                     geometric_relation_loss, axis_proxy_loss, axis_scale_loss,
-                                     axis_structure_loss)
+                                     axis_proxy_loss)
 from utils.data_utils import generate_augmentation
 
 
@@ -28,8 +27,8 @@ class Net(nn.Module):
         self.GAFA = GeometricAwareFeatureAggregator(cfg.GAFA)
         self.FD_Encoder = FrontDoorEncoder(cfg.FDEncoder)
         self.completion = ComposeCompletion(cfg.Completion, cfg.FDEncoder.feat_dim)
-        self.nocs_predictor = NOCS_Predictor(cfg.NOCS_Predictor)
-        self.estimator = PoseSizeEstimator(cfg.Completion.axis_points_per_axis)
+        self.estimator = PoseEstimator(cfg.Completion.axis_points_per_axis)
+        self.size_estimator = SizeEstimator(cfg.FDEncoder.feat_dim, cfg.cat_num)
         self.ULIP_model, self.tensor_list = ULIP_model, tensor_list
         self.projector_pts = nn.Sequential(nn.Linear(128, 128, bias=False), nn.GELU(), nn.Linear(128, 128, bias=False))
         nn.init.kaiming_normal_(self.projector_pts[0].weight)
@@ -56,7 +55,6 @@ class Net(nn.Module):
 
         center = pts.mean(1, keepdim=True)
         pts = pts - center
-        index = cls + torch.arange(b, device=pts.device) * self.cat_num
         if self.cfg.rgb_backbone == 'dino':
             rgb_local = self.rgb_extractor.forward_features(rgb)['x_prenorm'][:, 1:]
             side, channels = int(rgb_local.size(1) ** 0.5), rgb_local.size(2)
@@ -78,25 +76,25 @@ class Net(nn.Module):
         point_features = torch.cat((pts_local, rgb_local), dim=1).transpose(1, 2)
         kpt_feature = self.GAFA(heat_map @ point_features, observed_kpt.detach(), point_features, pts)
         kpt_feature = self.FD_Encoder(kpt_feature, select_global_feats)
-        completion, decoded = self.completion(observed_kpt, kpt_feature)
-        kpt_nocs = self.nocs_predictor(decoded, index)
+        completion, decoded = self.completion(observed_kpt.detach(), kpt_feature, pts, point_features)
         axis_nocs = self.completion.axis_template[None].expand(b, -1, -1)
-        pose_points = torch.cat((completion['completion_keypoints'], completion['axis_points']), dim=1)
-        pose_nocs = torch.cat((kpt_nocs.detach(), axis_nocs), dim=1)
-        pose_features = torch.cat((decoded, completion['axis_features']), dim=1)
-        r, t, s = self.estimator(pose_points, pose_nocs, pose_features)
+        # R and t are solved from the proxies and their object-frame coordinates alone. The
+        # proxies are trained only by their own supervision; the solver reads them as given.
+        r, t = self.estimator(completion['axis_points'].detach(), axis_nocs, completion['axis_features'])
+        s = self.size_estimator(completion['completion_keypoints'].detach(), decoded, cls)
 
         def restore(points):
             return (points @ delta_r.transpose(1, 2)) * delta_s.unsqueeze(2) + delta_t + center
 
         endpoints = {key: restore(completion[key]) for key in (
-            'completion_missing', 'completion_candidates', 'completion_coarse', 'axis_coarse', 'axis_points')}
+            'completion_missing', 'completion_candidates', 'completion_coarse', 'axis_points')}
+        axis_layers = completion['axis_layers']
         endpoints.update(
+            axis_layers=restore(axis_layers.flatten(1, 2)).view_as(axis_layers),
             observed_kpt_3d=restore(observed_kpt), pred_kpt_3d=restore(completion['completion_keypoints']),
             recon_model=restore(completion['completion_dense']),
             recon_delta=(completion['recon_delta'] @ delta_r.transpose(1, 2)) * delta_s.unsqueeze(2),
-            completion_scores=completion['completion_scores'], pred_heat_map=heat_map,
-            pred_kpt_nocs=kpt_nocs, kpt_nocs=kpt_nocs, axis_nocs=axis_nocs,
+            completion_scores=completion['completion_scores'], pred_heat_map=heat_map, axis_nocs=axis_nocs,
             pred_translation=delta_t.squeeze(1) + delta_s * (delta_r @ t.unsqueeze(2)).squeeze(2) + center.squeeze(1),
             pred_rotation=delta_r @ r, pred_size=s * delta_s,
         )
@@ -123,30 +121,20 @@ class Loss(nn.Module):
     def forward(self, endpoints):
         e, cfg = endpoints, self.cfg
         rotation, translation, size = e['rotation_label'], e['translation_label'], e['size_label']
-        scale = size.norm(dim=1).clamp_min(1e-8)[:, None, None]
         full_model = canonical_to_camera(e['model'], e['completion_rotation_label'], translation, size)
         completion = self.completion_loss(e, full_model)
         score = completion.pop('loss_score')
-        kpt_target = ((e['pred_kpt_3d'] - translation[:, None]) / scale @ rotation).detach()
-        axis_target = canonical_to_camera(e['axis_nocs'], rotation, translation, size)
         symmetric = (e['category_label'].reshape(-1, 1) == self.symmetric_categories).any(1)
-        axis_weights = torch.ones(size.size(0), 3, device=size.device)
-        axis_weights[symmetric] = axis_weights.new_tensor([0., 1., 0.])
-        axis_loss = axis_proxy_loss(e['axis_points'], axis_target, scale, axis_weights)
-        axis_loss = axis_loss + 0.5 * axis_proxy_loss(e['axis_coarse'], axis_target, scale, axis_weights)
+        axis_loss = axis_proxy_loss(e['axis_layers'], e['axis_nocs'], rotation, translation, size, symmetric)
         losses = {
             'loss_pose': cfg.pose * PoseDis(e['pred_rotation'], e['pred_translation'], e['pred_size'], rotation, translation, size),
-            'loss_nocs': cfg.nocs * SmoothL1Dis(e['pred_kpt_nocs'], kpt_target),
             'loss_cd': cfg.cd * torch.cdist(e['pts'], e['observed_kpt_3d']).amin(1).mean(),
             'loss_diversity': cfg.diversity * self.diversity_loss(e['observed_kpt_3d']),
             'loss_recon': cfg.recon * sum(completion.values()),
             'loss_delta': cfg.delta * e['recon_delta'].norm(dim=-1).mean(),
             'loss_distillation': cfg.distillation * (e['distillation_pointnet'] - e['distillation_ulip']).norm(dim=-1).mean(),
             'loss_score': cfg.score * score,
-            'loss_geo': cfg.geo * geometric_relation_loss(e['pred_kpt_3d'], e['pred_kpt_nocs'], size),
             'loss_axis': cfg.axis * axis_loss,
-            'loss_axis_scale': cfg.axis_scale * axis_scale_loss(e['axis_points'], scale, e['axis_nocs'].abs().amax()),
-            'loss_axis_structure': cfg.axis_structure * axis_structure_loss(e['axis_points'], scale),
         }
         losses['loss_all'] = sum(losses.values())
         losses.update({key: cfg.recon * value for key, value in completion.items()})

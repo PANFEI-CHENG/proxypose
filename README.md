@@ -88,18 +88,24 @@ python train.py --config config/REAL/camera_real.yaml
 The NOCS config enables ComPose-style completion immediately after `FD_Encoder`,
 implemented in [`model/compose_completion.py`](model/compose_completion.py) using
 the vendored AdaPoinTr attention blocks. Its memory contains only the 96 detected
-keypoints and their FD features. It selects and refines 64 completion keypoints, then
-expands them into 1,024 points for shape supervision. A parallel axis head
-directly generates three sampled coordinate axes (16 points per axis, 48 total),
-without predicting a pose to transform an axis template. Axis queries use global
-attention; local KNN attention only processes surface keypoints. The
-pose/size head uses **64 completion keypoints + 48 axis points**, with their
-features and separate pooling for the surface and each axis. The dense 1,024
-points are not pose-head inputs. Pose is read from the generated axes and refined
-with small feature-conditioned corrections. Optimizer and LR scheduler settings
-are unchanged. Size is regressed directly as three components, as in CleanPose,
-without multiplying by the generated axis scale. Weights and matching FD queues are saved every two epochs and at
-the final epoch.
+keypoints, with their FD features and coordinate encodings. It selects and refines
+64 completion keypoints, then expands them into 1,024 points for shape supervision.
+In the same decoder, 48 **axis-structure proxy** queries (16 per object axis), each
+embedded from its object-frame template coordinate, are decoded jointly with the
+completion queries. After every decoder layer, their camera-frame coordinates are
+regressed directly, without an observed origin/extent anchor or template offsets.
+Proxies use global attention only; local KNN attention only processes surface
+keypoints. Proxy supervision is a scale-normalized point distance on every decoder
+layer. For bottle/bowl/can, the GT yaw is aligned to the prediction in closed form,
+so all three axes are supervised. R and t come from `self.estimator` and use only
+the proxies: the pose is solved from the **detached** proxies and their object-frame
+template coordinates, then refined with small corrections from the proxy features.
+There is no keypoint NOCS branch. Size is estimated SecondPose-style: each of
+the 64 completion keypoints votes a category-specific size from its decoder feature,
+and the votes are averaged. Training uses AdamW (peak LR 5e-4, weight decay 0.05,
+none on biases/norm weights), one epoch of linear warmup, cosine decay to 1e-6 and
+gradient-norm clipping at 20. Weights and matching FD queues are saved every two
+epochs and at the final epoch.
 
 There is one completion/axis path; the old mode switches, native adapter and
 Reconstructor fallback have been removed. `recon_delta` contains the actual
@@ -158,7 +164,8 @@ For visualization, please run
 python visualize.py --config config/REAL/camera_real.yaml --test_epoch 30
 ```
 
-To randomly visualize the completed object and axis proxy points of a category with Open3D:
+To randomly compare the predicted completion/axis proxy points with the ground-truth
+CAD points/axes of a category in Open3D:
 
 ```bash
 .pixi/envs/default/bin/python demo_completion_axis.py --category camera
@@ -166,7 +173,8 @@ To randomly visualize the completed object and axis proxy points of a category w
 
 Valid categories are `bottle`, `bowl`, `camera`, `can`, `laptop`, and `mug`.
 Use `--seed 42` for a repeatable sample or `--no-window` to only export PLY files
-under `log/completion_axis_demo/`.
+under `log/completion_axis_demo/`. Prediction uses cyan and bright RGB; ground truth
+uses yellow and light RGB. Every geometry is a named layer that can be toggled.
 
 ## Acknowledgements
 Our implementation leverages the code from [DPDN](https://github.com/JiehongLin/Self-DPDN), [AG-Pose](https://github.com/Leeiieeo/AG-Pose) and [GOAT](https://github.com/CrystalSixone/VLN-GOAT). Thank them for their excellent works!

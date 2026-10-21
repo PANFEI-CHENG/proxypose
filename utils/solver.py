@@ -1,4 +1,6 @@
+import copy
 import logging
+import math
 import os
 import pickle as cPickle
 import time
@@ -8,14 +10,41 @@ import torch
 from tensorboardX import SummaryWriter
 from tqdm import tqdm
 
+
+def build_optimizer(model, cfg):
+    """AdamW without weight decay on biases and normalization weights (1-D tensors)."""
+    if cfg.name != 'AdamW':
+        return gorilla.solver.build_optimizer(model, copy.deepcopy(cfg))
+    params = [p for p in model.parameters() if p.requires_grad]
+    groups = [{'params': [p for p in params if p.ndim > 1]},
+              {'params': [p for p in params if p.ndim <= 1], 'weight_decay': 0.}]
+    return torch.optim.AdamW(groups, lr=cfg.lr, betas=tuple(cfg.betas), weight_decay=cfg.weight_decay)
+
+
+def build_lr_scheduler(optimizer, cfg, total_iters):
+    """Per-iteration linear warmup from warmup_factor * lr to lr, then cosine decay to min_lr."""
+    if cfg.name != 'WarmupCosine':
+        return gorilla.solver.build_lr_scheduler(optimizer, copy.deepcopy(cfg))
+    floor = cfg.min_lr / optimizer.defaults['lr']
+
+    def factor(step):
+        if step < cfg.warmup_iters:
+            return cfg.warmup_factor + (1 - cfg.warmup_factor) * step / cfg.warmup_iters
+        progress = min(1., (step - cfg.warmup_iters) / max(1, total_iters - cfg.warmup_iters))
+        return floor + (1 - floor) * 0.5 * (1 + math.cos(math.pi * progress))
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, factor)
+
+
 class Solver(gorilla.solver.BaseSolver):
     def __init__(self, model, loss, dataloaders, logger, cfg, start_epoch=1, start_iter=0):
-        super(Solver, self).__init__(
-            model=model,
-            dataloaders=dataloaders,
-            cfg=cfg,
-            logger=logger,
-        )
+        # Same state as BaseSolver.__init__, whose builders cannot create parameter groups.
+        self.model, self.dataloaders, self.cfg, self.logger = model, dataloaders, cfg, logger
+        self.optimizer = build_optimizer(model, cfg.optimizer)
+        self.lr_scheduler = build_lr_scheduler(
+            self.optimizer, cfg.lr_scheduler, cfg.max_epoch * cfg.train_dataset.num_mini_batch_per_epoch)
+        self.log_buffer = gorilla.solver.LogBuffer()
+        self.tb_writer = SummaryWriter(log_dir=cfg.log_dir)
+        self.meta = {}
         self.dataset_name = cfg.train_dataset.dataset_name
         self.loss = loss
         self.logger.propagate = 0
@@ -68,7 +97,7 @@ class Solver(gorilla.solver.BaseSolver):
             
             prefix = 'Epoch {} - '.format(self.epoch)
             write_info = self.get_logger_info(prefix, dict_info=dict_info)
-            write_info += f"lr: {self.lr_scheduler.get_lr()[0]:.5f}"
+            write_info += f"lr: {self.lr_scheduler.get_last_lr()[0]:.5f}"
             self.logger.warning(write_info)
             self.epoch += 1
 
@@ -99,6 +128,8 @@ class Solver(gorilla.solver.BaseSolver):
             forward_time = time.time()-end-data_time
 
             loss.backward()
+            if self.cfg.get('grad_clip'):
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.cfg.grad_clip)
             self.optimizer.step()
             backward_time = time.time() - end - forward_time-data_time
 
@@ -189,7 +220,7 @@ class Solver(gorilla.solver.BaseSolver):
         loss_all = (loss_dict_syn['loss_all']*b1 + loss_dict_real['loss_all']*b2) / (b1+b2)
 
         if mode == 'train':
-            dict_info['lr'] = self.lr_scheduler.get_lr()[0]
+            dict_info['lr'] = self.lr_scheduler.get_last_lr()[0]
 
         return loss_all, dict_info, tensor_list
     
@@ -212,7 +243,7 @@ class Solver(gorilla.solver.BaseSolver):
             dict_info[k] = float(v.item())
         
         if mode == 'train':
-            dict_info['lr'] = self.lr_scheduler.get_lr()[0]
+            dict_info['lr'] = self.lr_scheduler.get_last_lr()[0]
 
         return loss_dict['loss_all'], dict_info, tensor_list
 

@@ -1,6 +1,6 @@
-# 关键点补全 → 轴结构点生成 → 位姿修正
+# 关键点补全 + 轴结构代理点 → 位姿与尺寸
 
-当前路径为 `IAKD → GAFA → FD_Encoder → 补全/轴点生成 → 位姿尺寸`。
+当前路径为 `IAKD → GAFA → FD_Encoder → 补全与轴结构代理点联合解码 → 位姿 (R, t) / 尺寸 s`。
 只有这一条路径，没有 completion_mode 或旧 Reconstructor 回退。
 
 ## 点数与注意力
@@ -10,134 +10,182 @@
 
 | 阶段 | 当前设置 |
 |---|---|
-| encoder memory | 96 个 IAKD 关键点及其 FD 特征，256 维 |
+| decoder memory | 96 个 IAKD 关键点：FD 特征 + 坐标位置编码，256 维 |
 | 补全候选 | 64 个生成候选 + 32 个可见关键点候选 |
-| decoder 查询 | 64 个补全关键点 + 48 个轴点 |
-| 轴模板 | 每轴 16 点，标准坐标范围 [-0.4, 0.4] |
-| 位姿头输入 | 64 个补全关键点 + 48 个轴点及对应特征 |
+| decoder 查询 | 64 个补全关键点 + 48 个轴结构代理点 |
+| 代理点模板 | 每轴 16 点，物体坐标 [-0.4, 0.4]（以 ‖size‖ 为单位） |
+| 位姿头输入 | 只有 48 个代理点（坐标 detach）、它们的模板物体坐标和特征 |
+| 尺寸头输入 | 64 个补全关键点（坐标 detach）及其 decoder 特征 |
 | 稠密补全 | 每关键点展开 16 点，共 1024 点，仅用于形状监督 |
 
-已删除细粒度点的采样、投影与 memory 拼接，补全模块只接收 `(keypoints, features)`。
-GAFA 本身仍按原结构使用可见点特征；它与本次移除的补全 memory 细粒度输入不同。
-encoder/decoder 各两层、256 维、4 个注意力头。
+encoder 目前在代码中注释掉；decoder 两层、256 维、4 个注意力头。memory 加上关键点
+坐标的位置编码（与补全查询共用 `position` MLP）：去掉 encoder 后 memory 不再含显式
+坐标，而代理点需要在相机坐标中直接回归。
 
-两类查询共同参与全局 self-attention 和全局 cross-attention。decoder 第一层
-额外对 **64 个物体关键点** 做局部 self/cross graph attention，K=8；第二层
-仅使用全局注意力。局部 self-attention 的查询和邻居都是物体关键点，局部
-cross-attention 的邻居是 96 个观测关键点。轴点完全不参与 KNN 选邻居，也不会
-成为物体点的局部邻居。实现复用 AdaPoinTr 的注意力算子，见
+两类查询共同参与全局 self-attention 和全局 cross-attention。decoder 第一层额外对
+**64 个补全关键点** 做局部 self/cross graph attention，K=8；第二层仅使用全局注意力。
+代理点位于物体坐标轴上而不是物体表面，KNN 邻域没有几何意义，所以代理点既不是
+KNN 查询，也不会成为任何点的邻居。实现复用 AdaPoinTr 的注意力算子，见
 [来源与许可](../model/adapointr/UPSTREAM.md)。
 
-## 直接生成轴点
+## 轴结构代理点
 
-`axis_head` 与 `missing_head` 并行，从观测全局特征直接预测 48×3 个独立坐标偏移：
-
-```text
-coarse_axes = observed_center + observed_extent * (axis_template + point_offsets)
-final_axes  = coarse_axes + observed_extent * pointwise_refinement(decoded_axis_features)
-```
-
-`axis_head` 的输出是 144 维；细化头逐点输出 3 维。没有轴分支的旋转头、平移头、
-尺度头，也不把输出投影到刚性标架。模板只提供初始化形状、轴身份与采样顺序，
-允许网络对每个轴点独立生成和修正，因此生成结果可以暂时不直、不正交。
-观测中心和尺度来自 detached 关键点；尺度为 2.5 倍 RMS 半径，半径下限 0.02 m，
-避免检测关键点初始聚集时轴模板退化到零。它不是预测的物体中心或物体尺寸。
-
-标准轴在相机空间的监督目标仍用 GT 姿态构造：
+48 个代理点有固定的物体坐标 `c_k = τ_m e_a`（a ∈ {x, y, z}，τ_m 为 16 个等距刻度）。
+每个代理点查询由其物体坐标嵌入与实例全局特征相加得到，与补全查询一起解码；每层
+decoder 之后由共享的 `axis_head` 直接回归该代理点在相机坐标系（网络的中心化/增强
+坐标系，输出时还原）中的坐标：
 
 ```text
-target_axes = axis_template * ||size_gt|| @ rotation_gt.T + translation_gt
+query_k     = global_feature + axis_embed(c_k)
+p_k^(l)     = axis_head(LayerNorm(decoder_layer_l(query))_k),   l = 1, 2
+axis_points = p^(2)
 ```
 
-这只是生成点的监督目标，不在推理时提供 GT，也不以网络预测的位姿生成轴点。
-瓶/碗/罐（类别 0/1/3）仅监督可辨识的 Y 轴；其他类别监督三轴。
+没有观测中心 (origin)、观测尺度 (extent)、"模板 + 偏移"，也不预测 R/t/scale 去变换模板；
+48 个点各自独立回归，结果可以暂时不直、不正交。
 
-## 从轴点得到位姿，再作小幅修正
+监督目标由 GT 位姿构造，只在训练时使用：
 
-位姿头根据有序轴点与标准采样位置的线性相关，拟合三条轴的方向和长度，
-用 X/Y 方向构造正交旋转，用三轴点的均值估计中心，用三轴拟合长度估计统一尺度。
-这一步的方向是 **生成轴点 → 位姿**。
+```text
+target_k = ‖size_gt‖ · R_gt · R_y(ψ) · c_k + t_gt
+```
 
-关键点与轴点特征分别池化，再融合用于修正：旋转采用 `identity6D + 0.1*tanh(residual)`
-构造局部旋转并乘到轴点读取的旋转上；平移修正限制为每分量 `0.1*axis_scale`。
-主要旋转和中心必须由轴结构承担，特征分支负责小幅修正。尺寸沿用 CleanPose 的
-三维直接回归 `s = size_estimator(pose_feat)`，不乘轴尺度，也不施加 softplus。
-轴尺度仅用于平移修正的幅度，不约束尺寸输出；轴点自身的尺度监督继续保留。
+非对称类别 ψ = 0。瓶/碗/罐（类别 0/1/3）绕自身 Y 轴的 yaw 不可观测，ψ 取与当前预测
+最吻合的 yaw，有闭式解。记 `q_k = R_gtᵀ (p_k − t_gt)`：
+
+```text
+ψ = atan2( Σ_k (q_x c_z − q_z c_x),  Σ_k (q_x c_x + q_z c_z) )
+```
+
+所以对称类别的 X/Z 轴也受到监督（只差一个不可观测的 yaw），不再只监督 Y 轴。
+
+## 代理点监督
+
+```text
+L_axis = Σ_l mean_k ‖p_k^(l) − target_k‖₂ / ‖size_gt‖,   权重 2.0
+```
+
+相对旧版（细点 + 0.5×粗点的尺度归一化 Smooth L1，β = 0.05，权重 1）的加强：
+
+- 欧氏距离代替平方型 Smooth L1，误差变小时梯度不衰减；
+- 每个 decoder 层都监督（deep supervision）；
+- 对称类别也监督全部 48 个点；
+- 位姿损失不再回传到代理点（见下），代理点只由 `L_axis` 训练。
+
+已删除 `axis_scale_loss` 和 `axis_structure_loss`（长度、直线、共中心、正交、右手系软先验）：
+所有代理点都有 GT 监督后，这些先验是冗余的。
+
+## 位姿：代理点与物体坐标的对应关系
+
+R 和 t 只由 48 个代理点及其模板物体坐标（代理点的 NOCS）求解，不再使用补全关键点
+和它们的 NOCS，因此也去掉了 NOCS 预测器及其 `loss_nocs`、`loss_geo`。
+
+`self.estimator`（`PoseEstimator`，即原 `PoseSizeEstimator` 去掉尺寸分支和表面关键点
+输入）：用每根轴的代理点和刻度 τ 做最小二乘直线拟合得到方向 `v_a`，用 X/Y 方向
+（Y 优先的 Gram-Schmidt）构造旋转，用代理点均值作中心；再把代理点特征按轴分别池化
+（3 × 512），输出小幅修正：旋转 `identity6D + 0.1·tanh(residual)`，平移每分量不超过
+`0.1·axis_scale`。
+
+代理点在进入 estimator 前 **detach**：位姿损失只训练修正分支和代理点特征，不移动代理点。
+
+## 尺寸：SecondPose 的 t/s 分支结构
+
+尺寸不再由 estimator 回归，而由 `SizeEstimator` 从补全关键点及其特征估计。结构对应
+SecondPose/VI-Net `PN2.Net` 中 `s_mlp` 的末端：
+
+```text
+每个关键点: [MLP(xyz) (64), decoder 特征 (256)]
+  → Conv1d-BN-ReLU (256) → Conv1d-BN-ReLU (128) → Dropout(0.2) → Conv1d (3 × 6 类)
+  → 对 64 个关键点取平均 → 取所属类别的 3 维尺寸
+```
+
+关键点坐标 detach，特征保持可学习。尺寸仍由 `loss_pose` 中的尺寸项监督。
 
 ## 梯度边界
 
-- encoder 的坐标输入、decoder 的坐标位置编码和 KNN 坐标 detach。
+- 补全模块输入的 IAKD 关键点、decoder 的坐标位置编码和 KNN 坐标 detach。
 - 候选评分的坐标输入 detach，评分训练置信特征，不通过移动候选来提高评分。
-- 位姿头的逐点坐标/NOCS 特征编码输入 detach；NOCS 几何监督目标仍 detach。
-- **轴点坐标进入方向、中心、尺度读取时不 detach**，最终位姿损失可反传到粗轴点头、
-  细化轴点头及共享特征。粗轴点到细轴点的残差路径也保留梯度。
-- 所有关键点/轴点特征保持可学习；物体补全坐标由完整 CAD 损失训练，IAKD 仍有
-  观测表面和多样性监督，以及特征路径的梯度。
+- 位姿头：代理点坐标 detach（几何读出和逐点编码都不回传）；代理点的 **特征** 保持可学习。
+- 尺寸头：补全关键点坐标 detach，特征可学习。
+- 检查结果：`loss_pose` 对 `axis_head` 的梯度恰好为 0；`loss_axis` 对 estimator 和
+  尺寸头的梯度恰好为 0。
+
+## 优化器
+
+AdamW（betas 0.9 / 0.999，weight decay 0.05；bias 和归一化层权重等 1 维参数不衰减），
+按 iteration 调度：线性 warmup 4000 iter（1 个 epoch，从 0.001×lr 起）到峰值 5e-4，
+再余弦衰减到 1e-6，总长 `max_epoch × num_mini_batch_per_epoch = 30 × 4000`。
+全局梯度范数裁剪 `grad_clip: 20`：warmup 之后梯度范数中位数约 10，只有离群 batch
+（下文的 CAMERA 补全 Chamfer 尖峰）会被裁剪。
+gorilla 的构建器不能设置参数组，所以 `utils/solver.py` 中的 Solver 自己构建 AdamW 和
+调度器；其他 optimizer / scheduler 名字（例如旧的 Adam + CyclicLR）仍交给 gorilla 构建。
 
 ## 损失与保存
 
-保留三阶段完整 CAD 平方 Chamfer（权重 15）、候选评分（1）、NOCS（2）、
-几何关系（1）、位姿（0.3）、原观测点/蒸馏监督。`recon_delta` 是真实局部展开
-偏移，权重 0.05，在相机空间满足：
+保留三阶段完整 CAD 平方 Chamfer（权重 15）、候选评分（1）、位姿（0.3）、
+原观测点/蒸馏监督；NOCS（2）和几何关系（1）随 NOCS 分支一起删除。`recon_delta`
+是真实局部展开偏移，权重 0.05，在相机空间满足：
 
 ```text
 recon_model = pred_kpt_3d.repeat_interleave(16, dim=1) + recon_delta
 ```
 
-轴点监督为尺度归一化 Smooth L1：细点 + 0.5×粗点，权重 1。轴长度监督权重 0.1。
-新增权重 0.05 的软结构先验：直线/均匀采样、共中心、方向正交与右手方向。
-这些只约束生成点，不在前向中强制变换模板生成刚性轴。完整 CAD 使用原始
-`completion_rotation_label`，轴/NOCS 目标使用现有对称规范化 `rotation_label`。
+完整 CAD 使用原始 `completion_rotation_label`，代理点目标使用现有对称规范化的
+`rotation_label`。
 
-当前用户配置 batch size 为 40（30 CAMERA + 10 REAL），保留用户的最新修改。
-Adam 和 CyclicLR 保持不变，学习率范围 `2e-5 → 5e-4`。每 **2 个 epoch** 保存 `epoch_N.pt`，并保存
-匹配的 `tensor_list_epoch_N.pkl` 和更新兼容路径 `tensor_list.pkl`。最后一个 epoch
+学习率按 batch size 40（30 CAMERA + 10 REAL）选择。每 **2 个 epoch** 保存 `epoch_N.pt`，
+并保存匹配的 `tensor_list_epoch_N.pkl` 和更新兼容路径 `tensor_list.pkl`。最后一个 epoch
 也会保存，即使轮数为奇数。测试旧 epoch 时应使用与其匹配的 FD 队列。
 保存的是模型权重和 FD 队列，不是含优化器状态的断点续训包。
 
-本次改变了轴头、decoder 和位姿读出方式，旧结构 checkpoint 不能 strict 加载。
+本次改变了代理点头、尺寸头和损失，旧结构 checkpoint 不能 strict 加载。
 新实验应重新训练，并使用新的实验目录：
 
 ```bash
 .pixi/envs/default/bin/python train.py \
-  --config config/REAL/camera_real.yaml --gpus 0 --extra _axis_generation
+  --config config/REAL/camera_real.yaml --gpus 0 --extra _axis_proxy
 ```
 
 ## 本次验证
 
-下面 545 步记录对应此前的尺寸耦合版本；直接回归尺寸后的调试记录单独保存在
-`log/training_diagnosis_direct_size/`，不能把旧记录当作新版本的测量结果。
+`tests/test_axis_proxy.py` 检查：对称 yaw 对齐对任意 yaw 都能精确还原预测、非对称目标
+等于 GT、对齐后的目标不会比 GT 更远、理想代理点经 estimator 读回 GT 位姿（误差 < 1e-5）、
+学习率曲线（warmup 起点、峰值、单调衰减、终点 min_lr）和不衰减参数组：
 
 ```bash
-.pixi/envs/default/bin/python tools/smoke_completion.py \
-  --fixed-steps 240 --stream-steps 240 --peak-steps 60 --full-steps 5 \
-  --batch-size 40 --output log/axis_generation_smoke_b40
+.pixi/envs/default/bin/python tests/test_axis_proxy.py
 ```
 
-真实 CAMERA/REAL、生产 Solver、完整 DINO/PointNet++/ULIP，batch size 40，共 545 步。
-固定批次前/后 20 步平均总损失 **9.964 → 1.867**。所有损失和梯度有限，所有生成
-模块均收到梯度，没有梯度裁剪。最大梯度范数 88.28；最高学习率阶段前/后 20 步
-平均总损失 **1.328 → 0.855**。峰值已分配显存 15.92 GiB。
+另外确认：`loss_pose` 对 `axis_head` 的梯度为 0，`loss_axis` 对 estimator / 尺寸头的
+梯度为 0；生产 `Solver.solve()` 跑通两个小 epoch（裁剪、学习率日志、保存
+`epoch_N.pt` 与 FD 队列），并能按 `test.py` 的方式 strict 加载。
 
-下表是在同一训练探针批次上的 eval 指标，不是独立测试集成绩。
+### 学习率扫描
 
-| 指标 | 初始 | 固定批次 240 步后 | 全部 545 步后 |
-|---|---:|---:|---:|
-| 平方 Chamfer | 0.005954 | 0.000565 | 0.000526 |
-| 轴点平均距离（m，按对称性屏蔽） | 0.07567 | 0.03854 | 0.02751 |
-| 平移 L2（m） | 0.03690 | 0.02289 | 0.01783 |
-| 尺寸 L2（m） | 0.21357 | 0.07663 | 0.05264 |
-| 旋转矩阵 Frobenius 误差 | 2.68394 | 0.75729 | 0.41267 |
-| NOCS L1 | 0.06133 | 0.09432 | 0.08793 |
+真实 CAMERA/REAL、batch 30 + 10、AdamW（wd 0.05），压缩日程：2000 iter
+（200 iter warmup + 余弦）。探针为从训练列表中移除的 120 张 CAMERA + 40 张 REAL
+训练图像（与训练图像不重叠，但来自训练场景），**不是 REAL275 测试集**，数字不能与
+benchmark 结果比较；压缩日程也不等于 120k iter 的完整训练。下表为第 2000 iter 的
+REAL 探针结果，括号内为第 500 iter 的代理点误差：
 
-NOCS 误差尚未低于初始值；当前结果证明短程可学习与数值可运行，不能证明最终
-泛化精度优于旧结构。需要完整训练和 REAL275 评估。
+| 峰值 lr | 裁剪 | 末 200 iter 损失 | 旋转 ° | 平移 cm | 尺寸 cm | 代理点 cm | 5°2cm | 10°5cm |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| 2.5e-4 | 无 | 0.968 | 10.6 | 0.98 | 1.95 | 1.36 (3.65) | 17.5% | 57.5% |
+| 5e-4 | 无 | 0.870 | 6.6 | 0.80 | 2.02 | 1.14 (3.22) | 52.5% | 82.5% |
+| 1e-3 | 无 | 0.856 | 7.0 | 0.89 | 1.56 | 1.19 (6.02) | 47.5% | 77.5% |
+| **5e-4** | **20** | 0.875 | 5.7 | 0.82 | 1.73 | 1.12 (3.02) | 57.5% | 92.5% |
 
-针对设计的检查确认：KNN 的查询数仅为 64、轴头输出 144 维独立点坐标、单独位姿
-损失可以训练轴生成头、被 detach 的坐标路径没有梯度、理想轴点可正确读回已知
-位姿，以及第 2 轮和奇数最后一轮能保存权重与配套队列。
-当时的单样本推理检查覆盖 strict 权重加载、实际 memory/位姿输入点数、合法旋转、
-正尺寸与 `recon_delta` 坐标还原恒等式（当前直接尺寸回归不再强制正值）。本地记录位于
-`log/axis_generation_smoke_b40/report.json`、`steps.jsonl`、`design_checks.json` 和
-`inference_checks.json`；日志目录被 Git 忽略，不包含在仓库中。
-此前 batch size 4 的 545 步检查记录单独保留在 `log/axis_generation_smoke/`。
+CAMERA 探针（120 张）趋势相同：5°2cm 依次为 5.8%、50.0%、48.3%、50.8%。
+2.5e-4 收敛明显更慢；1e-3 在峰值附近不稳定（第 500 iter REAL 代理点误差 6.0 cm、平移
+4.7 cm，约为 5e-4 的两倍），衰减后才追上；5e-4 全程最好。四个运行都没有非有限值；
+每个运行约 8 次单步损失尖峰，全部来自 CAMERA 部分的补全 Chamfer（缺失 / 关键点 /
+稠密三项同时跳变，下一步立即恢复），是离群样本而不是优化发散。裁剪 20 只作用于
+4.4% 的 iter（warmup 后 0.34%），最终损失不变、探针相当或略好（40 张 REAL 图像，
+差 2.5% 即一张图），因此保留。
+
+以上扫描在去掉 NOCS 分支之前完成。去掉后用同一设置（5e-4、裁剪 20、同一种子与数据）
+重跑：第 2000 iter CAMERA 探针旋转 6.83°（原 6.89°）、代理点 1.14 cm（原 1.19 cm）、
+5°2cm 55.0%（原 50.8%）；REAL 探针旋转 5.87°（原 5.65°）、代理点 1.07 cm（原 1.12 cm）、
+5°2cm 52.5%（原 57.5%）、10°5cm 80.0%（原 92.5%）。REAL 两次带 NOCS 的运行之间也差了
+10 个百分点，所以这些差别都在 40 张图的波动范围内；前期收敛更快（第 500 iter 代理点
+误差 2.5–2.7 cm，原 3.0–3.4 cm）。是否有影响需要完整训练和 REAL275 测试确认。
