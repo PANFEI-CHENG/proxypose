@@ -340,3 +340,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+# .pixi/envs/default/bin/python demo_completion_axis.py --split train --category mug     --checkpoint log/camera_real_sym_align_e50/ckpt/epoch_30.pt

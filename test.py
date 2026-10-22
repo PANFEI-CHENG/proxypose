@@ -101,7 +101,10 @@ if __name__ == "__main__":
         if not os.path.isdir(save_path):
             os.mkdir(save_path)
 
-        cfg.test_dataset.tensor_list_dir = os.path.join(cfg.ckpt_dir, 'tensor_list.pkl')
+        # Use the FD queue saved with this checkpoint; tensor_list.pkl belongs to the last epoch.
+        matching = os.path.join(cfg.ckpt_dir, 'tensor_list_epoch_' + str(cfg.test_epoch) + '.pkl')
+        cfg.test_dataset.tensor_list_dir = matching if os.path.exists(matching) else os.path.join(cfg.ckpt_dir, 'tensor_list.pkl')
+        logger.info("=> FD queue: {}".format(cfg.test_dataset.tensor_list_dir))
         with open(cfg.test_dataset.tensor_list_dir, 'rb') as f:
             tensor_list = cPickle.load(f)
 
