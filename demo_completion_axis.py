@@ -23,7 +23,8 @@ for subdir in ('provider', 'model', 'model/pointnet2', 'utils'):
     sys.path.insert(0, str(ROOT / subdir))
 
 from model.Net import Net
-from provider.nocs_dataset import TestDataset
+from model.compose_completion import axis_target, canonical_to_camera
+from provider.nocs_dataset import TestDataset, TrainingDataset
 
 CATEGORIES = {'bottle': 0, 'bowl': 1, 'camera': 2, 'can': 3, 'laptop': 4, 'mug': 5}
 PRED_COLORS = ((1.0, 0.1, 0.1), (0.1, 1.0, 0.1), (0.1, 0.35, 1.0))
@@ -37,7 +38,13 @@ def parse_args():
     parser.add_argument('--category', required=True, choices=CATEGORIES)
     parser.add_argument('--config', default='config/REAL/camera_real.yaml')
     parser.add_argument('--checkpoint', default='log/camera_real_completion_axis1020/ckpt/epoch_30.pt')
-    parser.add_argument('--tensor-list', default=None)
+    parser.add_argument('--split', default='test', choices=('test', 'train'),
+                        help='test: REAL275 detections; train: a GT-masked training instance.')
+    parser.add_argument('--train-source', default='real', choices=('real', 'syn'),
+                        help='Training images for --split train: REAL train or CAMERA train.')
+    parser.add_argument('--tensor-list', default=None,
+                        help='Default: tensor_list_<checkpoint name>.pkl beside the checkpoint, '
+                             'else tensor_list.pkl')
     parser.add_argument('--model-bank', default=None,
                         help='Default: <test_dataset.dataset_dir>/obj_models/real_test.pkl')
     parser.add_argument('--gpu', default='0')
@@ -70,6 +77,26 @@ def choose_sample(dataset, category, rng):
         if matches:
             return sample, rng.choice(matches)
     raise RuntimeError(f'No valid {category} instance found.')
+
+
+def choose_train_sample(dataset, category, rng, max_tries=50):
+    """Draw a random training image containing the category, then an instance of it.
+
+    TrainingDataset picks the instance of an image at random (and may jump to another
+    image when depth or mask is invalid), so draw until the instance has the category.
+    """
+    class_id = CATEGORIES[category] + 1
+    order = list(range(len(dataset.img_list)))
+    rng.shuffle(order)
+    for index in order:
+        with open(os.path.join(dataset.data_dir, dataset.img_list[index]) + '_label.pkl', 'rb') as f:
+            if class_id not in pickle.load(f)['class_ids']:
+                continue
+        for _ in range(max_tries):
+            sample = dataset[index]
+            if int(sample['category_label']) == class_id - 1:
+                return sample, dataset.img_list[index]
+    raise RuntimeError(f'No valid {category} training instance found.')
 
 
 def match_gt(sample, instance):
@@ -185,30 +212,12 @@ def show_keypoints(object_keypoints, cad96_gt, pred_axes, gt_axes,
         vis.destroy_window()
 
 
-def main():
-    args = parse_args()
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
-    if not torch.cuda.is_available():
-        raise RuntimeError('CUDA GPU is not available.')
-
-    rng = random.Random(args.seed)
-    if args.seed is not None:
-        random.seed(args.seed)
-        np.random.seed(args.seed)
-        torch.manual_seed(args.seed)
-
-    cfg = gorilla.Config.fromfile(args.config)
+def run_test(args, cfg, model, rng):
     if cfg.test_dataset.dataset_name != 'real':
         raise ValueError('This script uses real_test.pkl and REAL275 metadata; select real test dataset.')
-
-    checkpoint = Path(args.checkpoint)
-    tensor_path = Path(args.tensor_list) if args.tensor_list else checkpoint.parent / 'tensor_list.pkl'
     model_bank_path = Path(args.model_bank) if args.model_bank else (
         Path(cfg.test_dataset.dataset_dir) / 'obj_models' / 'real_test.pkl'
     )
-    with open(tensor_path, 'rb') as f:
-        tensor_list = pickle.load(f)
-
     dataset = TestDataset(
         cfg.test_dataset.img_size,
         cfg.test_dataset.sample_num,
@@ -222,20 +231,12 @@ def main():
     source_path = dataset.result_pkl_list[source_index]
 
     inputs = {key: sample[key].cuda() for key in ('rgb', 'pts', 'choose', 'category_label')}
-    model = Net(cfg.pose_net, ULIP_model=None, tensor_list=tensor_list).cuda().eval()
-    gorilla.solver.load_checkpoint(model=model, filename=str(checkpoint), strict=True)
     with torch.inference_mode():
         prediction = model(inputs)
 
     object_keypoints = prediction['pred_kpt_3d'][instance].detach().cpu().numpy()
     pred_axes = prediction['axis_points'][instance].detach().cpu().numpy()
     template = model.completion.axis_template.detach().cpu().numpy()
-    points_per_axis = int(cfg.pose_net.Completion.axis_points_per_axis)
-    num_queries = int(cfg.pose_net.Completion.num_query)
-    if len(object_keypoints) != num_queries:
-        raise RuntimeError(f'Expected {num_queries} predicted keypoints, got {len(object_keypoints)}.')
-    if len(pred_axes) != 3 * points_per_axis or len(template) != 3 * points_per_axis:
-        raise RuntimeError('Predicted axis/template count does not match configured axis points.')
 
     gt_index, match_iou = match_gt(sample, instance)
     rt = sample['gt_RTs'][gt_index].numpy()
@@ -257,11 +258,78 @@ def main():
     print(f'Category: {args.category}; image index: {source_index}; detection: {instance}')
     print(f'GT instance index: {gt_index}; 2D bbox matching IoU: {match_iou:.3f}')
     print(f'CAD model: {model_id}; metadata: {meta_path}')
+    if match_iou < 0.3:
+        print('WARNING: Low 2D detection-to-GT matching IoU; GT CAD may be mismatched.')
+    return object_keypoints, cad96_gt, pred_axes, gt_axes
+
+
+def run_train(args, cfg, model, rng):
+    """A training instance with its GT mask, as the network sees it in training
+    (including color jitter); GT proxies are the targets of the axis loss."""
+    data_type = 'real_withLabel' if args.train_source == 'real' else 'syn'
+    dataset = TrainingDataset(
+        cfg.train_dataset.image_size,
+        cfg.train_dataset.sample_num,
+        cfg.train_dataset.dataset_dir,
+        data_type,
+        threshold=cfg.train_dataset.outlier_th,
+    )
+    sample, image_path = choose_train_sample(dataset, args.category, rng)
+    sample = {key: value.unsqueeze(0).cuda() for key, value in sample.items()}
+    with torch.inference_mode():
+        prediction = model(sample)
+
+    symmetric = torch.tensor([CATEGORIES[args.category] in cfg.loss.symmetric_categories], device='cuda')
+    gt_axes = axis_target(prediction['axis_points'], prediction['axis_nocs'], sample['rotation_label'],
+                          sample['translation_label'], sample['size_label'], symmetric)
+    # The CAD model is placed with the uncanonicalized rotation, as in the completion loss.
+    cad96 = torch.as_tensor(sample_cad_96(sample['model'][0].cpu().numpy()), dtype=torch.float32, device='cuda')
+    cad96_gt = canonical_to_camera(cad96[None], sample['completion_rotation_label'],
+                                   sample['translation_label'], sample['size_label'])
+
+    print(f'Category: {args.category}; training image ({args.train_source}): {image_path}')
+    return (prediction['pred_kpt_3d'][0].cpu().numpy(), cad96_gt[0].cpu().numpy(),
+            prediction['axis_points'][0].cpu().numpy(), gt_axes[0].cpu().numpy())
+
+
+def main():
+    args = parse_args()
+    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    if not torch.cuda.is_available():
+        raise RuntimeError('CUDA GPU is not available.')
+
+    rng = random.Random(args.seed)
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+
+    cfg = gorilla.Config.fromfile(args.config)
+    checkpoint = Path(args.checkpoint)
+    if args.tensor_list:
+        tensor_path = Path(args.tensor_list)
+    else:
+        tensor_path = checkpoint.parent / f'tensor_list_{checkpoint.stem}.pkl'
+        if not tensor_path.is_file():
+            tensor_path = checkpoint.parent / 'tensor_list.pkl'
+    with open(tensor_path, 'rb') as f:
+        tensor_list = pickle.load(f)
+    model = Net(cfg.pose_net, ULIP_model=None, tensor_list=tensor_list).cuda().eval()
+    gorilla.solver.load_checkpoint(model=model, filename=str(checkpoint), strict=True)
+    print(f'Checkpoint: {checkpoint}; tensor list: {tensor_path}')
+
+    run = run_train if args.split == 'train' else run_test
+    object_keypoints, cad96_gt, pred_axes, gt_axes = run(args, cfg, model, rng)
+    points_per_axis = int(cfg.pose_net.Completion.axis_points_per_axis)
+    num_queries = int(cfg.pose_net.Completion.num_query)
+    if len(object_keypoints) != num_queries:
+        raise RuntimeError(f'Expected {num_queries} predicted keypoints, got {len(object_keypoints)}.')
+    if len(pred_axes) != 3 * points_per_axis or len(gt_axes) != 3 * points_per_axis:
+        raise RuntimeError('Predicted axis/template count does not match configured axis points.')
+
     print(f'Predicted keypoints: {len(object_keypoints)} (yellow)')
     print(f'GT-pose CAD points: {len(cad96_gt)} (purple)')
     print(f'Axis proxies: {len(pred_axes)} predicted + {len(gt_axes)} GT')
-    if match_iou < 0.3:
-        print('WARNING: Low 2D detection-to-GT matching IoU; GT CAD may be mismatched.')
     print('Prediction axes: RGB; GT axes: light RGB')
 
     show_keypoints(
